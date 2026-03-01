@@ -7,6 +7,7 @@
 
 use crate::auth::AuthMode;
 use crate::error::EnvVarError;
+use crate::github_copilot_auth;
 use codex_api::Provider as ApiProvider;
 use codex_api::provider::RetryConfig as ApiRetryConfig;
 use http::HeaderMap;
@@ -27,6 +28,16 @@ const MAX_STREAM_MAX_RETRIES: u64 = 100;
 const MAX_REQUEST_MAX_RETRIES: u64 = 100;
 
 const OPENAI_PROVIDER_NAME: &str = "OpenAI";
+const GITHUB_COPILOT_PROVIDER_NAME: &str = "GitHub Copilot";
+const GITHUB_COPILOT_DEFAULT_BASE_URL: &str = "https://api.githubcopilot.com";
+const GITHUB_COPILOT_BASE_URL_ENV_VAR: &str = "GITHUB_COPILOT_BASE_URL";
+const GITHUB_COPILOT_TOKEN_ENV_VAR: &str = "GITHUB_TOKEN";
+// Copilot's gateway expects these legacy header values and UA format.
+const GITHUB_COPILOT_INTENT_HEADER_NAME: &str = "Openai-Intent";
+const GITHUB_COPILOT_INTENT_HEADER_VALUE: &str = "conversation-edits";
+const GITHUB_COPILOT_INITIATOR_HEADER_NAME: &str = "x-initiator";
+const GITHUB_COPILOT_INITIATOR_HEADER_VALUE: &str = "user";
+const GITHUB_COPILOT_USER_AGENT_PREFIX: &str = "opencode";
 const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
 pub(crate) const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
 pub(crate) const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
@@ -180,16 +191,22 @@ impl ModelProviderInfo {
     pub fn api_key(&self) -> crate::error::Result<Option<String>> {
         match &self.env_key {
             Some(env_key) => {
-                let api_key = std::env::var(env_key)
-                    .ok()
-                    .filter(|v| !v.trim().is_empty())
-                    .ok_or_else(|| {
-                        crate::error::CodexErr::EnvVar(EnvVarError {
-                            var: env_key.clone(),
-                            instructions: self.env_key_instructions.clone(),
-                        })
-                    })?;
-                Ok(Some(api_key))
+                if let Some(api_key) = std::env::var(env_key).ok().filter(|v| !v.trim().is_empty())
+                {
+                    return Ok(Some(api_key));
+                }
+
+                if env_key == GITHUB_COPILOT_TOKEN_ENV_VAR
+                    && let Some(saved) = github_copilot_auth::load_from_default_codex_home()
+                    && !saved.access_token.trim().is_empty()
+                {
+                    return Ok(Some(saved.access_token));
+                }
+
+                Err(crate::error::CodexErr::EnvVar(EnvVarError {
+                    var: env_key.clone(),
+                    instructions: self.env_key_instructions.clone(),
+                }))
             }
             None => Ok(None),
         }
@@ -259,6 +276,66 @@ impl ModelProviderInfo {
     pub fn is_openai(&self) -> bool {
         self.name == OPENAI_PROVIDER_NAME
     }
+
+    pub fn is_github_copilot(&self) -> bool {
+        self.name == GITHUB_COPILOT_PROVIDER_NAME
+            || self.env_key.as_deref() == Some(GITHUB_COPILOT_TOKEN_ENV_VAR)
+            || self.base_url.as_deref().is_some_and(|base_url| {
+                let base_url = base_url.to_ascii_lowercase();
+                base_url.contains("githubcopilot.com") || base_url.contains("copilot-api.")
+            })
+    }
+
+    pub fn create_github_copilot_provider() -> ModelProviderInfo {
+        let base_url = std::env::var(GITHUB_COPILOT_BASE_URL_ENV_VAR)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| {
+                github_copilot_auth::load_from_default_codex_home()
+                    .and_then(|auth| auth.enterprise_domain)
+                    .map(|domain| github_copilot_auth::enterprise_base_url(&domain))
+            })
+            .unwrap_or_else(|| GITHUB_COPILOT_DEFAULT_BASE_URL.to_string());
+        let user_agent = format!(
+            "{GITHUB_COPILOT_USER_AGENT_PREFIX}/{}",
+            env!("CARGO_PKG_VERSION")
+        );
+
+        ModelProviderInfo {
+            name: GITHUB_COPILOT_PROVIDER_NAME.into(),
+            base_url: Some(base_url),
+            env_key: Some(GITHUB_COPILOT_TOKEN_ENV_VAR.to_string()),
+            env_key_instructions: Some(
+                "Set GITHUB_TOKEN (for example: `export GITHUB_TOKEN=\"$(gh auth token)\"`) or run `codex-provider-auth github login` and `codex-provider-auth github setup` before running Codex."
+                    .to_string(),
+            ),
+            experimental_bearer_token: None,
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: Some(
+                [
+                    ("User-Agent".to_string(), user_agent),
+                    (
+                        GITHUB_COPILOT_INTENT_HEADER_NAME.to_string(),
+                        GITHUB_COPILOT_INTENT_HEADER_VALUE.to_string(),
+                    ),
+                    (
+                        GITHUB_COPILOT_INITIATOR_HEADER_NAME.to_string(),
+                        GITHUB_COPILOT_INITIATOR_HEADER_VALUE.to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            // Copilot provider auth is independent from OpenAI ChatGPT login.
+            requires_openai_auth: false,
+            supports_websockets: false,
+        }
+    }
 }
 
 pub const DEFAULT_LMSTUDIO_PORT: u16 = 1234;
@@ -266,15 +343,15 @@ pub const DEFAULT_OLLAMA_PORT: u16 = 11434;
 
 pub const LMSTUDIO_OSS_PROVIDER_ID: &str = "lmstudio";
 pub const OLLAMA_OSS_PROVIDER_ID: &str = "ollama";
+pub const GITHUB_COPILOT_PROVIDER_ID: &str = "github-copilot";
 
 /// Built-in default provider list.
 pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
     use ModelProviderInfo as P;
 
-    // We do not want to be in the business of adjucating which third-party
-    // providers are bundled with Codex CLI, so we only include the OpenAI and
-    // open source ("oss") providers by default. Users are encouraged to add to
-    // `model_providers` in config.toml to add their own providers.
+    // Keep the built-in list intentionally small and focused on common
+    // providers. Users can add/override providers in `model_providers` inside
+    // config.toml.
     [
         ("openai", P::create_openai_provider()),
         (
@@ -284,6 +361,10 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
         (
             LMSTUDIO_OSS_PROVIDER_ID,
             create_oss_provider(DEFAULT_LMSTUDIO_PORT, WireApi::Responses),
+        ),
+        (
+            GITHUB_COPILOT_PROVIDER_ID,
+            P::create_github_copilot_provider(),
         ),
     ]
     .into_iter()
@@ -437,5 +518,68 @@ wire_api = "chat"
 
         let err = toml::from_str::<ModelProviderInfo>(provider_toml).unwrap_err();
         assert!(err.to_string().contains(CHAT_WIRE_API_REMOVED_ERROR));
+    }
+
+    #[test]
+    fn github_copilot_provider_uses_responses_and_expected_headers() {
+        let provider = ModelProviderInfo::create_github_copilot_provider();
+
+        assert_eq!(provider.name, GITHUB_COPILOT_PROVIDER_NAME);
+        assert_eq!(
+            provider.base_url,
+            Some(GITHUB_COPILOT_DEFAULT_BASE_URL.to_string())
+        );
+        assert_eq!(
+            provider.env_key,
+            Some(GITHUB_COPILOT_TOKEN_ENV_VAR.to_string())
+        );
+        assert_eq!(provider.wire_api, WireApi::Responses);
+        assert_eq!(provider.requires_openai_auth, false);
+        assert_eq!(provider.supports_websockets, false);
+
+        let headers = provider.http_headers.expect("copilot provider has headers");
+        assert_eq!(
+            headers.get(GITHUB_COPILOT_INTENT_HEADER_NAME),
+            Some(&GITHUB_COPILOT_INTENT_HEADER_VALUE.to_string())
+        );
+        assert_eq!(
+            headers.get(GITHUB_COPILOT_INITIATOR_HEADER_NAME),
+            Some(&GITHUB_COPILOT_INITIATOR_HEADER_VALUE.to_string())
+        );
+        assert_eq!(
+            headers
+                .get("User-Agent")
+                .expect("copilot provider has user-agent")
+                .starts_with(GITHUB_COPILOT_USER_AGENT_PREFIX),
+            true
+        );
+    }
+
+    #[test]
+    fn built_in_providers_include_github_copilot() {
+        let providers = built_in_model_providers();
+        assert_eq!(providers.contains_key(GITHUB_COPILOT_PROVIDER_ID), true);
+        assert_eq!(
+            providers[GITHUB_COPILOT_PROVIDER_ID].wire_api,
+            WireApi::Responses
+        );
+    }
+
+    #[test]
+    fn github_copilot_detection_matches_common_provider_shapes() {
+        let provider = ModelProviderInfo::create_github_copilot_provider();
+        assert!(provider.is_github_copilot());
+
+        let mut by_env =
+            create_oss_provider_with_base_url("http://localhost:1234/v1", WireApi::Responses);
+        by_env.env_key = Some("GITHUB_TOKEN".to_string());
+        assert!(by_env.is_github_copilot());
+
+        let mut by_base_url = create_oss_provider_with_base_url(
+            "https://copilot-api.example.com",
+            WireApi::Responses,
+        );
+        by_base_url.env_key = None;
+        assert!(by_base_url.is_github_copilot());
     }
 }

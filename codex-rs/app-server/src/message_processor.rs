@@ -183,11 +183,12 @@ impl MessageProcessor {
         auth_manager.set_external_auth_refresher(Arc::new(ExternalAuthRefreshBridge {
             outgoing: outgoing.clone(),
         }));
-        let thread_manager = Arc::new(ThreadManager::new(
+        let thread_manager = Arc::new(ThreadManager::new_with_provider(
             config.codex_home.clone(),
             auth_manager.clone(),
             SessionSource::VSCode,
             config.model_catalog.clone(),
+            config.model_provider.clone(),
             CollaborationModesConfig {
                 default_mode_request_user_input: config
                     .features

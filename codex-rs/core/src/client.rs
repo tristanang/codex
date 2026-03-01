@@ -103,6 +103,8 @@ pub const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 pub const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 pub const X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER: &str =
     "x-responsesapi-include-timing-metrics";
+const GITHUB_COPILOT_INITIATOR_HEADER: &str = "x-initiator";
+const GITHUB_COPILOT_INITIATOR_AGENT: &str = "agent";
 const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
 
 pub fn ws_version_from_features(config: &Config) -> bool {
@@ -270,6 +272,11 @@ impl ModelClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = websocket_session;
     }
 
+    fn is_github_copilot_subagent_session(&self) -> bool {
+        self.state.provider.is_github_copilot()
+            && matches!(self.state.session_source, SessionSource::SubAgent(_))
+    }
+
     /// Compacts the current conversation history using the Compact endpoint.
     ///
     /// This is a unary call (no streaming) that returns a new list of
@@ -364,6 +371,12 @@ impl ModelClient {
             if let Ok(val) = HeaderValue::from_str(&subagent) {
                 extra_headers.insert("x-openai-subagent", val);
             }
+        }
+        if self.is_github_copilot_subagent_session() {
+            extra_headers.insert(
+                GITHUB_COPILOT_INITIATOR_HEADER,
+                HeaderValue::from_static(GITHUB_COPILOT_INITIATOR_AGENT),
+            );
         }
         extra_headers
     }
@@ -567,14 +580,21 @@ impl ModelClientSession {
     ) -> ApiResponsesOptions {
         let turn_metadata_header = parse_turn_metadata_header(turn_metadata_header);
         let conversation_id = self.client.state.conversation_id.to_string();
+        let mut extra_headers = build_responses_headers(
+            self.client.state.beta_features_header.as_deref(),
+            Some(&self.turn_state),
+            turn_metadata_header.as_ref(),
+        );
+        if self.client.is_github_copilot_subagent_session() {
+            extra_headers.insert(
+                GITHUB_COPILOT_INITIATOR_HEADER,
+                HeaderValue::from_static(GITHUB_COPILOT_INITIATOR_AGENT),
+            );
+        }
         ApiResponsesOptions {
             conversation_id: Some(conversation_id),
             session_source: Some(self.client.state.session_source.clone()),
-            extra_headers: build_responses_headers(
-                self.client.state.beta_features_header.as_deref(),
-                Some(&self.turn_state),
-                turn_metadata_header.as_ref(),
-            ),
+            extra_headers,
             compression,
             turn_state: Some(Arc::clone(&self.turn_state)),
         }
@@ -1257,6 +1277,7 @@ impl WebsocketTelemetry for ApiTelemetry {
 #[cfg(test)]
 mod tests {
     use super::ModelClient;
+    use codex_api::requests::responses::Compression;
     use codex_otel::OtelManager;
     use codex_protocol::ThreadId;
     use codex_protocol::openai_models::ModelInfo;
@@ -1270,6 +1291,13 @@ mod tests {
             "https://example.com/v1",
             crate::model_provider_info::WireApi::Responses,
         );
+        test_model_client_with_provider(session_source, provider)
+    }
+
+    fn test_model_client_with_provider(
+        session_source: SessionSource,
+        provider: crate::model_provider_info::ModelProviderInfo,
+    ) -> ModelClient {
         ModelClient::new(
             None,
             ThreadId::new(),
@@ -1338,6 +1366,42 @@ mod tests {
             .get("x-openai-subagent")
             .and_then(|value| value.to_str().ok());
         assert_eq!(value, Some("memory_consolidation"));
+    }
+
+    #[test]
+    fn build_subagent_headers_sets_agent_initiator_for_github_copilot_subagent() {
+        let provider =
+            crate::model_provider_info::ModelProviderInfo::create_github_copilot_provider();
+        let client = test_model_client_with_provider(
+            SessionSource::SubAgent(SubAgentSource::Other("review".to_string())),
+            provider,
+        );
+        let headers = client.build_subagent_headers();
+        let subagent = headers
+            .get("x-openai-subagent")
+            .and_then(|value| value.to_str().ok());
+        let initiator = headers
+            .get("x-initiator")
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(subagent, Some("review"));
+        assert_eq!(initiator, Some("agent"));
+    }
+
+    #[test]
+    fn build_responses_options_sets_agent_initiator_for_github_copilot_subagent() {
+        let provider =
+            crate::model_provider_info::ModelProviderInfo::create_github_copilot_provider();
+        let client = test_model_client_with_provider(
+            SessionSource::SubAgent(SubAgentSource::Other("review".to_string())),
+            provider,
+        );
+        let session = client.new_session();
+        let options = session.build_responses_options(None, Compression::None);
+        let initiator = options
+            .extra_headers
+            .get("x-initiator")
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(initiator, Some("agent"));
     }
 
     #[tokio::test]

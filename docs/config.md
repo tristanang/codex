@@ -50,3 +50,12 @@ override), not "inherit the global default". There is currently no separate
 config value for "follow the global default in Plan mode".
 
 Ctrl+C/Ctrl+D quitting uses a ~1 second double-press hint (`ctrl + c again to quit`).
+
+## Local GitHub provider hack
+
+For local/fork builds using GitHub Copilot as the model provider:
+
+1. Run `codex-provider-auth github login` to complete OAuth and store credentials.
+2. Run `codex-provider-auth github setup` to write `model_provider_beta = "github-copilot"` in `~/.codex/config.toml`.
+
+`model_provider_beta` is intended as a local fallback key for this flow.

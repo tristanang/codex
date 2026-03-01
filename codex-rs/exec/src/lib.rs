@@ -474,11 +474,12 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         true,
         config.cli_auth_credentials_store_mode,
     );
-    let thread_manager = Arc::new(ThreadManager::new(
+    let thread_manager = Arc::new(ThreadManager::new_with_provider(
         config.codex_home.clone(),
         auth_manager.clone(),
         SessionSource::Exec,
         config.model_catalog.clone(),
+        config.model_provider.clone(),
         CollaborationModesConfig {
             default_mode_request_user_input: config
                 .features

@@ -22,7 +22,7 @@ const GITHUB_COPILOT_OAUTH_CLIENT_ID: &str = "Ov23li8tweQw6odWQebz";
 const GITHUB_COPILOT_OAUTH_SCOPE: &str = "read:user";
 const DEFAULT_GITHUB_DOMAIN: &str = "github.com";
 const LOGIN_SUCCESS_MESSAGE: &str = "Successfully logged in";
-const MODEL_PROVIDER_BETA_KEY: &str = "model_provider_beta";
+const MODEL_PROVIDER_KEY: &str = "model_provider";
 const GITHUB_PROVIDER_ID: &str = "github-copilot";
 
 #[derive(Debug, Clone, Copy)]
@@ -140,7 +140,7 @@ async fn run() -> i32 {
             GithubSubcommand::Setup => match run_github_setup(&codex_home) {
                 Ok(()) => {
                     eprintln!(
-                        "Configured {MODEL_PROVIDER_BETA_KEY} = \"{GITHUB_PROVIDER_ID}\" in config.toml"
+                        "Configured {MODEL_PROVIDER_KEY} = \"{GITHUB_PROVIDER_ID}\" in config.toml"
                     );
                     0
                 }
@@ -160,7 +160,7 @@ async fn run() -> i32 {
                         }
                     );
                     eprintln!(
-                        "Provider setup ({MODEL_PROVIDER_BETA_KEY}): {}",
+                        "Provider setup ({MODEL_PROVIDER_KEY}): {}",
                         if status.provider_configured {
                             "configured"
                         } else {
@@ -225,7 +225,7 @@ async fn run_github_login(codex_home: &Path, enterprise_url: Option<String>) -> 
 fn run_github_setup(codex_home: &Path) -> io::Result<()> {
     ConfigEditsBuilder::new(codex_home)
         .with_edits([ConfigEdit::SetPath {
-            segments: vec![MODEL_PROVIDER_BETA_KEY.to_string()],
+            segments: vec![MODEL_PROVIDER_KEY.to_string()],
             value: GITHUB_PROVIDER_ID.to_string().into(),
         }])
         .apply_blocking()
@@ -235,7 +235,7 @@ fn run_github_setup(codex_home: &Path) -> io::Result<()> {
 fn run_github_status(codex_home: &Path) -> io::Result<GithubStatus> {
     let auth_present = github_copilot_auth::load(codex_home)?.is_some();
     let provider_configured =
-        read_model_provider_beta(codex_home)?.as_deref() == Some(GITHUB_PROVIDER_ID);
+        read_model_provider(codex_home)?.as_deref() == Some(GITHUB_PROVIDER_ID);
 
     Ok(GithubStatus {
         auth_present,
@@ -247,7 +247,7 @@ fn run_github_logout(codex_home: &Path) -> io::Result<bool> {
     github_copilot_auth::remove(codex_home)
 }
 
-fn read_model_provider_beta(codex_home: &Path) -> io::Result<Option<String>> {
+fn read_model_provider(codex_home: &Path) -> io::Result<Option<String>> {
     let config_path = codex_home.join(CONFIG_TOML_FILE);
     let config_contents = match fs::read_to_string(&config_path) {
         Ok(contents) => contents,
@@ -268,7 +268,7 @@ fn read_model_provider_beta(codex_home: &Path) -> io::Result<Option<String>> {
     })?;
 
     Ok(config
-        .get(MODEL_PROVIDER_BETA_KEY)
+        .get(MODEL_PROVIDER_KEY)
         .and_then(TomlValue::as_str)
         .map(str::to_string))
 }
@@ -713,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_writes_model_provider_beta_only() {
+    fn setup_writes_model_provider_only() {
         let codex_home = tempdir().expect("tempdir");
 
         run_github_setup(codex_home.path()).expect("setup succeeds");
@@ -723,12 +723,11 @@ mod tests {
         let config: TomlValue = toml::from_str(&config_contents).expect("parse toml");
 
         assert_eq!(
-            config
-                .get(MODEL_PROVIDER_BETA_KEY)
-                .and_then(TomlValue::as_str),
+            config.get(MODEL_PROVIDER_KEY).and_then(TomlValue::as_str),
             Some(GITHUB_PROVIDER_ID)
         );
-        assert_eq!(config.get("model_provider"), None);
+        assert_eq!(config.get("model_provider_root"), None);
+        assert_eq!(config.get("model_provider_beta"), None);
     }
 
     #[test]
@@ -755,7 +754,7 @@ mod tests {
         .expect("save auth");
         fs::write(
             codex_home.path().join(CONFIG_TOML_FILE),
-            "model_provider_beta = \"github-copilot\"\n",
+            "model_provider = \"github-copilot\"\n",
         )
         .expect("write config");
 
@@ -783,7 +782,7 @@ mod tests {
         .expect("save auth");
         fs::write(
             codex_home.path().join(CONFIG_TOML_FILE),
-            "model_provider_beta = \"openai\"\n",
+            "model_provider = \"openai\"\n",
         )
         .expect("write config");
 
