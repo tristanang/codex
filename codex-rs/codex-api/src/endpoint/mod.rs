@@ -1,3 +1,4 @@
+pub mod chat;
 pub mod compact;
 pub mod memories;
 pub mod models;
