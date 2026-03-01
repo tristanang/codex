@@ -5626,6 +5626,65 @@ trust_level = "trusted"
     }
 
     #[test]
+    fn test_model_provider_used_when_profile_override_absent() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg = ConfigToml {
+            model_provider: Some("github-copilot".to_string()),
+            ..Default::default()
+        };
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.model_provider_id, "github-copilot");
+        Ok(())
+    }
+
+    #[test]
+    fn test_profile_model_provider_overrides_model_provider() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg = ConfigToml {
+            model_provider: Some("github-copilot".to_string()),
+            profile: Some("dev".to_string()),
+            profiles: HashMap::from([(
+                "dev".to_string(),
+                ConfigProfile {
+                    model_provider: Some("openai".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.model_provider_id, "openai");
+        Ok(())
+    }
+
+    #[test]
+    fn test_openai_used_when_model_provider_missing() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg = ConfigToml::default();
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.model_provider_id, "openai");
+        Ok(())
+    }
+
+    #[test]
     fn test_untrusted_project_gets_workspace_write_sandbox() -> anyhow::Result<()> {
         let config_with_untrusted = r#"
 [projects."/tmp/test"]

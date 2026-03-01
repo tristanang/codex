@@ -151,6 +151,24 @@ impl ThreadManager {
         model_catalog: Option<ModelsResponse>,
         collaboration_modes_config: CollaborationModesConfig,
     ) -> Self {
+        Self::new_with_provider(
+            codex_home,
+            auth_manager,
+            session_source,
+            model_catalog,
+            ModelProviderInfo::create_openai_provider(),
+            collaboration_modes_config,
+        )
+    }
+
+    pub fn new_with_provider(
+        codex_home: PathBuf,
+        auth_manager: Arc<AuthManager>,
+        session_source: SessionSource,
+        model_catalog: Option<ModelsResponse>,
+        model_provider: ModelProviderInfo,
+        collaboration_modes_config: CollaborationModesConfig,
+    ) -> Self {
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
         let plugins_manager = Arc::new(PluginsManager::new(codex_home.clone()));
         let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
@@ -163,10 +181,11 @@ impl ThreadManager {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 thread_created_tx,
-                models_manager: Arc::new(ModelsManager::new(
+                models_manager: Arc::new(ModelsManager::new_with_provider(
                     codex_home,
                     auth_manager.clone(),
                     model_catalog,
+                    model_provider,
                     collaboration_modes_config,
                 )),
                 skills_manager,

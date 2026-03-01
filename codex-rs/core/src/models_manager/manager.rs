@@ -11,13 +11,21 @@ use crate::model_provider_info::ModelProviderInfo;
 use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::models_manager::collaboration_mode_presets::builtin_collaboration_mode_presets;
 use crate::models_manager::model_info;
+use codex_api::ApiError;
+use codex_api::AuthProvider as _;
 use codex_api::ModelsClient;
 use codex_api::ReqwestTransport;
+use codex_client::HttpTransport;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use http::HeaderMap;
+use http::Method;
+use http::header::AUTHORIZATION;
+use http::header::ETAG;
+use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +38,44 @@ use tracing::info;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 const MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Deserialize)]
+struct GithubCopilotModelsResponse {
+    #[serde(default)]
+    data: Vec<GithubCopilotModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubCopilotModel {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    model_picker_enabled: Option<bool>,
+    #[serde(default)]
+    supported_endpoints: Option<Vec<String>>,
+}
+
+impl GithubCopilotModel {
+    fn supports_responses_api(&self) -> bool {
+        self.supported_endpoints
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|endpoint| {
+                endpoint
+                    .trim()
+                    .trim_end_matches('/')
+                    .to_ascii_lowercase()
+                    .ends_with("/responses")
+            })
+    }
+
+    fn matches_picker_family_whitelist(&self) -> bool {
+        let model_id = self.id.to_ascii_lowercase();
+        model_id.contains("claude") || model_id.contains("gemini")
+    }
+}
 
 /// Strategy for refreshing available models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +121,22 @@ impl ModelsManager {
         model_catalog: Option<ModelsResponse>,
         collaboration_modes_config: CollaborationModesConfig,
     ) -> Self {
+        Self::new_with_provider(
+            codex_home,
+            auth_manager,
+            model_catalog,
+            ModelProviderInfo::create_openai_provider(),
+            collaboration_modes_config,
+        )
+    }
+
+    pub fn new_with_provider(
+        codex_home: PathBuf,
+        auth_manager: Arc<AuthManager>,
+        model_catalog: Option<ModelsResponse>,
+        provider: ModelProviderInfo,
+        collaboration_modes_config: CollaborationModesConfig,
+    ) -> Self {
         let cache_path = codex_home.join(MODEL_CACHE_FILE);
         let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
         let catalog_mode = if model_catalog.is_some() {
@@ -95,7 +157,7 @@ impl ModelsManager {
             auth_manager,
             etag: RwLock::new(None),
             cache_manager,
-            provider: ModelProviderInfo::create_openai_provider(),
+            provider,
         }
     }
 
@@ -245,7 +307,10 @@ impl ModelsManager {
             return Ok(());
         }
 
-        if self.auth_manager.auth_mode() != Some(AuthMode::Chatgpt) {
+        let can_refresh_without_chatgpt_auth = self.provider.is_github_copilot();
+        if self.auth_manager.auth_mode() != Some(AuthMode::Chatgpt)
+            && !can_refresh_without_chatgpt_auth
+        {
             if matches!(
                 refresh_strategy,
                 RefreshStrategy::Offline | RefreshStrategy::OnlineIfUncached
@@ -281,27 +346,97 @@ impl ModelsManager {
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.fetch_update.duration_ms", &[]);
         let auth = self.auth_manager.auth().await;
-        let auth_mode = self.auth_manager.auth_mode();
-        let api_provider = self.provider.to_api_provider(auth_mode)?;
-        let api_auth = auth_provider_from_auth(auth.clone(), &self.provider)?;
-        let transport = ReqwestTransport::new(build_reqwest_client());
-        let client = ModelsClient::new(transport, api_provider, api_auth);
+        let (models, etag) = if self.provider.is_github_copilot() {
+            self.fetch_and_decode_github_models(auth).await?
+        } else {
+            let auth_mode = self.auth_manager.auth_mode();
+            let api_provider = self.provider.to_api_provider(auth_mode)?;
+            let api_auth = auth_provider_from_auth(auth.clone(), &self.provider)?;
+            let transport = ReqwestTransport::new(build_reqwest_client());
+            let client = ModelsClient::new(transport, api_provider, api_auth);
 
-        let client_version = crate::models_manager::client_version_to_whole();
-        let (models, etag) = timeout(
-            MODELS_REFRESH_TIMEOUT,
-            client.list_models(&client_version, HeaderMap::new()),
-        )
-        .await
-        .map_err(|_| CodexErr::Timeout)?
-        .map_err(map_api_error)?;
+            let client_version = crate::models_manager::client_version_to_whole();
+            timeout(
+                MODELS_REFRESH_TIMEOUT,
+                client.list_models(&client_version, HeaderMap::new()),
+            )
+            .await
+            .map_err(|_| CodexErr::Timeout)?
+            .map_err(map_api_error)?
+        };
 
         self.apply_remote_models(models.clone()).await;
         *self.etag.write().await = etag.clone();
+        let client_version = crate::models_manager::client_version_to_whole();
         self.cache_manager
             .persist_cache(&models, etag, client_version)
             .await;
         Ok(())
+    }
+
+    async fn fetch_and_decode_github_models(
+        &self,
+        auth: Option<crate::CodexAuth>,
+    ) -> CoreResult<(Vec<ModelInfo>, Option<String>)> {
+        let auth_mode = self.auth_manager.auth_mode();
+        let api_provider = self.provider.to_api_provider(auth_mode)?;
+        let api_auth = auth_provider_from_auth(auth, &self.provider)?;
+        let transport = ReqwestTransport::new(build_reqwest_client());
+        let mut request = api_provider.build_request(Method::GET, "models");
+
+        if let Some(token) = api_auth.bearer_token() {
+            let auth_header = format!("Bearer {token}").parse().map_err(|err| {
+                CodexErr::Stream(format!("invalid authorization header: {err}"), None)
+            })?;
+            request.headers.insert(AUTHORIZATION, auth_header);
+        }
+
+        let response = timeout(MODELS_REFRESH_TIMEOUT, transport.execute(request))
+            .await
+            .map_err(|_| CodexErr::Timeout)?
+            .map_err(|err| map_api_error(ApiError::Transport(err)))?;
+        let etag = response
+            .headers
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        let parsed: GithubCopilotModelsResponse =
+            serde_json::from_slice(&response.body).map_err(|err| {
+                CodexErr::Stream(
+                    format!("failed to decode GitHub Copilot /models response: {err}"),
+                    None,
+                )
+            })?;
+        let bundled_models = Self::load_remote_models_from_file().unwrap_or_default();
+        let mut filtered_models = Vec::new();
+        for remote_model in parsed.data {
+            let supports_responses_api = remote_model.supports_responses_api();
+            let is_whitelisted_for_picker = remote_model.matches_picker_family_whitelist();
+            if !supports_responses_api && !is_whitelisted_for_picker {
+                continue;
+            }
+
+            let model_id = remote_model.id;
+            let mut model = bundled_models
+                .iter()
+                .find(|candidate| candidate.slug == model_id)
+                .cloned()
+                .unwrap_or_else(|| model_info::model_info_from_slug_quiet(&model_id));
+            model.slug = model_id.clone();
+            model.display_name = remote_model.name.unwrap_or_else(|| model_id.clone());
+            model.visibility =
+                if is_whitelisted_for_picker || remote_model.model_picker_enabled.unwrap_or(true) {
+                    ModelVisibility::List
+                } else {
+                    ModelVisibility::Hide
+                };
+            model.supported_in_api = true;
+            model.priority = i32::try_from(filtered_models.len()).unwrap_or(i32::MAX);
+            model.used_fallback_model_metadata = false;
+            filtered_models.push(model);
+        }
+
+        Ok((filtered_models, etag))
     }
 
     async fn get_etag(&self) -> Option<String> {
@@ -440,7 +575,11 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use tempfile::tempdir;
+    use wiremock::Mock;
     use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
 
     fn remote_model(slug: &str, display: &str, priority: i32) -> ModelInfo {
         remote_model_with_visibility(slug, display, priority, "list")
@@ -960,6 +1099,114 @@ mod tests {
             0,
             "no auth should avoid /models requests"
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_available_models_fetches_github_models_without_chatgpt_auth() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [
+                    {
+                        "id": "gpt-5.2-codex",
+                        "name": "GPT-5.2 Codex",
+                        "model_picker_enabled": true,
+                        "supported_endpoints": ["/responses"]
+                    },
+                    {
+                        "id": "gpt-5-mini",
+                        "name": "GPT-5 mini",
+                        "model_picker_enabled": false,
+                        "supported_endpoints": ["/responses"]
+                    },
+                    {
+                        "id": "chat-only-model",
+                        "name": "Chat Only",
+                        "model_picker_enabled": true,
+                        "supported_endpoints": ["/chat/completions"]
+                    },
+                    {
+                        "id": "claude-3.7-sonnet",
+                        "name": "Claude 3.7 Sonnet",
+                        "model_picker_enabled": false,
+                        "supported_endpoints": ["/chat/completions"]
+                    },
+                    {
+                        "id": "GEMINI-2.5-PRO",
+                        "name": "Gemini 2.5 Pro",
+                        "model_picker_enabled": false,
+                        "supported_endpoints": null
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let codex_home = tempdir().expect("temp dir");
+        let auth_manager = Arc::new(AuthManager::new(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        ));
+        let mut provider = ModelProviderInfo::create_github_copilot_provider();
+        provider.base_url = Some(server.uri());
+        provider.env_key = None;
+        let manager = ModelsManager::with_provider_for_tests(
+            codex_home.path().to_path_buf(),
+            auth_manager,
+            provider,
+        );
+
+        manager
+            .refresh_available_models(RefreshStrategy::Online)
+            .await
+            .expect("github provider should refresh without chatgpt auth");
+
+        let cached_remote = manager.get_remote_models().await;
+        let codex_model = cached_remote
+            .iter()
+            .find(|candidate| candidate.slug == "gpt-5.2-codex")
+            .expect("responses model should be merged into cache");
+        assert_eq!(codex_model.display_name, "GPT-5.2 Codex");
+        assert_eq!(codex_model.visibility, ModelVisibility::List);
+
+        let mini_model = cached_remote
+            .iter()
+            .find(|candidate| candidate.slug == "gpt-5-mini")
+            .expect("second responses model should be merged into cache");
+        assert_eq!(mini_model.visibility, ModelVisibility::Hide);
+
+        let claude_model = cached_remote
+            .iter()
+            .find(|candidate| candidate.slug == "claude-3.7-sonnet")
+            .expect("whitelisted claude chat/completions model should be merged into cache");
+        assert_eq!(claude_model.visibility, ModelVisibility::List);
+
+        let gemini_model = cached_remote
+            .iter()
+            .find(|candidate| candidate.slug == "GEMINI-2.5-PRO")
+            .expect("whitelisted gemini chat/completions model should be merged into cache");
+        assert_eq!(gemini_model.visibility, ModelVisibility::List);
+
+        assert!(
+            !cached_remote
+                .iter()
+                .any(|candidate| candidate.slug == "chat-only-model"),
+            "non-whitelisted chat-only models should be filtered out"
+        );
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request capture should succeed");
+        let models_requests = requests
+            .iter()
+            .filter(|request| request.url.path() == "/models")
+            .count();
+        assert_eq!(models_requests, 1, "expected one GET /models request");
     }
 
     #[test]
