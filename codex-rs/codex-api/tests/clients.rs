@@ -6,6 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use codex_api::AuthProvider;
+use codex_api::ChatClient;
 use codex_api::Provider;
 use codex_api::ResponsesApiRequest;
 use codex_api::ResponsesClient;
@@ -208,6 +209,20 @@ async fn responses_client_uses_responses_path() -> Result<()> {
 
     let requests = state.take_stream_requests();
     assert_path_ends_with(&requests, "/responses");
+    Ok(())
+}
+
+#[tokio::test]
+async fn chat_client_uses_chat_completions_path() -> Result<()> {
+    let state = RecordingState::default();
+    let transport = RecordingTransport::new(state.clone());
+    let client = ChatClient::new(transport, provider("openai"), NoAuth);
+
+    let body = serde_json::json!({ "echo": true });
+    let _stream = client.stream(body, HeaderMap::new()).await?;
+
+    let requests = state.take_stream_requests();
+    assert_path_ends_with(&requests, "/chat/completions");
     Ok(())
 }
 
