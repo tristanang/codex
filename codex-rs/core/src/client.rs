@@ -35,6 +35,8 @@ use crate::api_bridge::CoreAuthProvider;
 use crate::api_bridge::auth_provider_from_auth;
 use crate::api_bridge::map_api_error;
 use crate::auth::UnauthorizedRecovery;
+use codex_api::AggregateStreamExt;
+use codex_api::ChatClient as ApiChatClient;
 use codex_api::CompactClient as ApiCompactClient;
 use codex_api::CompactionInput as ApiCompactionInput;
 use codex_api::MemoriesClient as ApiMemoriesClient;
@@ -45,6 +47,7 @@ use codex_api::RequestTelemetry;
 use codex_api::ReqwestTransport;
 use codex_api::ResponseAppendWsRequest;
 use codex_api::ResponseCreateWsRequest;
+use codex_api::ResponseStream as ApiResponseStream;
 use codex_api::ResponsesApiRequest;
 use codex_api::ResponsesClient as ApiResponsesClient;
 use codex_api::ResponsesOptions as ApiResponsesOptions;
@@ -98,6 +101,7 @@ use crate::error::Result;
 use crate::flags::CODEX_RS_SSE_FIXTURE;
 use crate::model_provider_info::ModelProviderInfo;
 use crate::model_provider_info::WireApi;
+use crate::tools::spec::create_tools_json_for_chat_completions_api;
 use crate::tools::spec::create_tools_json_for_responses_api;
 
 pub const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
@@ -527,6 +531,15 @@ impl ModelClientSession {
                 .swap(true, Ordering::Relaxed)
     }
 
+    fn needs_chat_completions_wire(&self, model_info: &ModelInfo) -> bool {
+        if !self.client.state.provider.is_github_copilot() {
+            return false;
+        }
+
+        let model_id = model_info.slug.to_ascii_lowercase();
+        model_id.contains("claude") || model_id.contains("gemini")
+    }
+
     fn build_responses_request(
         &self,
         provider: &codex_api::Provider,
@@ -807,6 +820,61 @@ impl ModelClientSession {
         }
     }
 
+    /// Streams a turn via the OpenAI Chat Completions API.
+    async fn stream_chat_completions(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        otel_manager: &OtelManager,
+    ) -> Result<ApiResponseStream> {
+        if prompt.output_schema.is_some() {
+            return Err(CodexErr::UnsupportedOperation(
+                "output_schema is not supported for Chat Completions API".to_string(),
+            ));
+        }
+
+        let auth_manager = self.client.state.auth_manager.clone();
+        let instructions = prompt.base_instructions.text.clone();
+        let input = prompt.get_formatted_input();
+        let tools = create_tools_json_for_chat_completions_api(&prompt.tools)?;
+        let conversation_id = self.client.state.conversation_id.to_string();
+        let session_source = self.client.state.session_source.clone();
+
+        let mut auth_recovery = auth_manager
+            .as_ref()
+            .map(super::auth::AuthManager::unauthorized_recovery);
+        loop {
+            let client_setup = self.client.current_client_setup().await?;
+            let transport = ReqwestTransport::new(build_reqwest_client());
+            let (request_telemetry, sse_telemetry) = Self::build_streaming_telemetry(otel_manager);
+            let client =
+                ApiChatClient::new(transport, client_setup.api_provider, client_setup.api_auth)
+                    .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+
+            let stream_result = client
+                .stream_prompt(
+                    &model_info.slug,
+                    &instructions,
+                    &input,
+                    &tools,
+                    Some(conversation_id.clone()),
+                    Some(session_source.clone()),
+                )
+                .await;
+
+            match stream_result {
+                Ok(stream) => return Ok(stream),
+                Err(ApiError::Transport(
+                    unauthorized_transport @ TransportError::Http { status, .. },
+                )) if status == StatusCode::UNAUTHORIZED => {
+                    handle_unauthorized(unauthorized_transport, &mut auth_recovery).await?;
+                    continue;
+                }
+                Err(err) => return Err(map_api_error(err)),
+            }
+        }
+    }
+
     /// Streams a turn via the OpenAI Responses API.
     ///
     /// Handles SSE fixtures, reasoning summaries, verbosity, and the
@@ -1058,6 +1126,15 @@ impl ModelClientSession {
         let wire_api = self.client.state.provider.wire_api;
         match wire_api {
             WireApi::Responses => {
+                if self.needs_chat_completions_wire(model_info) {
+                    let api_stream = self
+                        .stream_chat_completions(prompt, model_info, otel_manager)
+                        .await?;
+                    let (stream, _) =
+                        map_response_stream(api_stream.aggregate(), otel_manager.clone());
+                    return Ok(stream);
+                }
+
                 if let Some(ws_version) = self.client.active_ws_version(model_info) {
                     match self
                         .stream_responses_websocket(
@@ -1460,6 +1537,45 @@ mod tests {
             .get("x-initiator")
             .and_then(|value| value.to_str().ok());
         assert_eq!(initiator, Some("agent"));
+    }
+
+    #[test]
+    fn needs_chat_completions_wire_for_github_claude_and_gemini_models() {
+        let provider =
+            crate::model_provider_info::ModelProviderInfo::create_github_copilot_provider();
+        let client = test_model_client_with_provider(SessionSource::Cli, provider);
+        let session = client.new_session();
+
+        let mut claude = test_model_info();
+        claude.slug = "claude-3.7-sonnet".to_string();
+        assert!(session.needs_chat_completions_wire(&claude));
+
+        let mut gemini = test_model_info();
+        gemini.slug = "GEMINI-2.5-PRO".to_string();
+        assert!(session.needs_chat_completions_wire(&gemini));
+    }
+
+    #[test]
+    fn needs_chat_completions_wire_ignores_non_matching_provider_or_model() {
+        let github_provider =
+            crate::model_provider_info::ModelProviderInfo::create_github_copilot_provider();
+        let github_client = test_model_client_with_provider(SessionSource::Cli, github_provider);
+        let github_session = github_client.new_session();
+
+        let mut gpt_model = test_model_info();
+        gpt_model.slug = "gpt-5.2-codex".to_string();
+        assert!(!github_session.needs_chat_completions_wire(&gpt_model));
+
+        let oss_provider = crate::model_provider_info::create_oss_provider_with_base_url(
+            "https://example.com/v1",
+            crate::model_provider_info::WireApi::Responses,
+        );
+        let oss_client = test_model_client_with_provider(SessionSource::Cli, oss_provider);
+        let oss_session = oss_client.new_session();
+
+        let mut claude = test_model_info();
+        claude.slug = "claude-3.7-sonnet".to_string();
+        assert!(!oss_session.needs_chat_completions_wire(&claude));
     }
 
     #[tokio::test]
