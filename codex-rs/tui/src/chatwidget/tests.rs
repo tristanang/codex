@@ -6463,6 +6463,39 @@ async fn reasoning_popup_escape_returns_to_model_popup() {
 }
 
 #[tokio::test]
+async fn model_selection_dismisses_parent_popup_after_opening_reasoning() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.1-codex-max")).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    let preset = get_available_model(&chat, "gpt-5.1-codex-max");
+    chat.open_all_models_popup(vec![preset]);
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let event = rx
+        .try_recv()
+        .expect("expected AppEvent::OpenReasoningPopup");
+    let reasoning_preset = match event {
+        AppEvent::OpenReasoningPopup { model } => model,
+        other => panic!("expected AppEvent::OpenReasoningPopup, got {other:?}"),
+    };
+
+    let after_model_select = render_bottom_popup(&chat, 80);
+    assert!(
+        !after_model_select.contains("Select Model and Effort"),
+        "expected parent model popup to be dismissed, got: {after_model_select}"
+    );
+
+    chat.open_reasoning_popup(reasoning_preset);
+    let reasoning_popup = render_bottom_popup(&chat, 80);
+    assert!(reasoning_popup.contains("Select Reasoning Level"));
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    let after_reasoning_escape = render_bottom_popup(&chat, 80);
+    assert!(!after_reasoning_escape.contains("Select Reasoning Level"));
+    assert!(!after_reasoning_escape.contains("Select Model and Effort"));
+}
+
+#[tokio::test]
 async fn exec_history_extends_previous_when_consecutive() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
 
