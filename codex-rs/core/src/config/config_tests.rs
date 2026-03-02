@@ -2701,12 +2701,13 @@ fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
         fixture.codex_home(),
     )?;
     assert_eq!(
-        Config {
-            model: Some("o3".to_string()),
-            review_model: None,
-            model_context_window: None,
-            model_auto_compact_token_limit: None,
-            service_tier: None,
+            Config {
+                model: Some("o3".to_string()),
+                review_model: None,
+                subagent_model: None,
+                model_context_window: None,
+                model_auto_compact_token_limit: None,
+                service_tier: None,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
             permissions: Permissions {
@@ -2833,6 +2834,7 @@ fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
     let expected_gpt3_profile_config = Config {
         model: Some("gpt-3.5-turbo".to_string()),
         review_model: None,
+        subagent_model: None,
         model_context_window: None,
         model_auto_compact_token_limit: None,
         service_tier: None,
@@ -2960,6 +2962,7 @@ fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
     let expected_zdr_profile_config = Config {
         model: Some("o3".to_string()),
         review_model: None,
+        subagent_model: None,
         model_context_window: None,
         model_auto_compact_token_limit: None,
         service_tier: None,
@@ -3073,6 +3076,7 @@ fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
     let expected_gpt5_profile_config = Config {
         model: Some("gpt-5.1".to_string()),
         review_model: None,
+        subagent_model: None,
         model_context_window: None,
         model_auto_compact_token_limit: None,
         service_tier: None,
