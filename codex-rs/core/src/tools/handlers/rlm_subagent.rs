@@ -26,6 +26,7 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde::Serialize;
 use std::sync::Arc;
+use tracing::info;
 
 const DEFAULT_MAX_ITERATIONS: usize = 16;
 const MIN_MAX_DEPTH: i32 = 2;
@@ -184,7 +185,14 @@ impl RlmWorkerModel for ResponsesApiRlmWorkerModel {
         prompt: &str,
         history: &[RlmIterationRecord],
     ) -> Result<String, RlmSubagentError> {
+        let iteration = history.len() + 1;
         let message = build_iteration_message(prompt, history);
+        info!(
+            iteration,
+            model = %self.model_info.slug,
+            prompt = %message,
+            "rlm iteration prompt"
+        );
         let request = Prompt {
             input: vec![ResponseItem::Message {
                 id: None,
@@ -241,6 +249,12 @@ impl RlmWorkerModel for ResponsesApiRlmWorkerModel {
                 "worker model returned empty response".to_string(),
             ));
         }
+        info!(
+            iteration,
+            model = %self.model_info.slug,
+            response = %trimmed,
+            "rlm iteration response"
+        );
         Ok(trimmed.to_string())
     }
 }
