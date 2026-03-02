@@ -115,7 +115,6 @@ codex-otel = { path = "otel" }
 codex-artifact-presentation = { path = "artifact-presentation" }
 codex-artifact-spreadsheet = { path = "artifact-spreadsheet" }
 codex-process-hardening = { path = "process-hardening" }
-codex-provider-auth-cli = { path = "provider-auth-cli" }
 codex-protocol = { path = "protocol" }
 codex-responses-api-proxy = { path = "responses-api-proxy" }
 codex-rmcp-client = { path = "rmcp-client" }
