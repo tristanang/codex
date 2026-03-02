@@ -932,7 +932,11 @@ fn build_agent_resume_config(
 fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallError> {
     let base_config = turn.config.clone();
     let mut config = (*base_config).clone();
-    config.model = Some(turn.model_info.slug.clone());
+    let model = config
+        .subagent_model
+        .clone()
+        .unwrap_or_else(|| turn.model_info.slug.clone());
+    config.model = Some(model);
     config.model_provider = turn.provider.clone();
     config.model_reasoning_effort = turn.reasoning_effort;
     config.model_reasoning_summary = Some(turn.reasoning_summary);

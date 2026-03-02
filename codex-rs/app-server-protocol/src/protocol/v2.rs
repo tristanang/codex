@@ -486,6 +486,7 @@ const fn default_include_platform_defaults() -> bool {
 pub struct Config {
     pub model: Option<String>,
     pub review_model: Option<String>,
+    pub subagent_model: Option<String>,
     pub model_context_window: Option<i64>,
     pub model_auto_compact_token_limit: Option<i64>,
     pub model_provider: Option<String>,
