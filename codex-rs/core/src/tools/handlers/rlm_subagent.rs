@@ -5,6 +5,8 @@ use crate::client_common::ResponseEvent;
 use crate::codex::TurnContext;
 use crate::compact::content_items_to_text;
 use crate::function_tool::FunctionCallError;
+use crate::rlm::subagent::DEFAULT_MAX_ITERATIONS;
+use crate::rlm::subagent::MIN_MAX_DEPTH;
 use crate::rlm::subagent::RlmIterationRecord;
 use crate::rlm::subagent::RlmSubagent;
 use crate::rlm::subagent::RlmSubagentConfig;
@@ -28,8 +30,6 @@ use serde::Serialize;
 use std::sync::Arc;
 use tracing::info;
 
-const DEFAULT_MAX_ITERATIONS: usize = 16;
-const MIN_MAX_DEPTH: i32 = 2;
 const HISTORY_TAIL: usize = 4;
 const RLM_WORKER_INSTRUCTIONS: &str = r#"You are an RLM worker operating a persistent Python REPL.
 Use only ```repl``` fenced blocks for executable code.
@@ -314,5 +314,23 @@ mod tests {
         assert!(msg.contains("Iteration 1 model response:\none"));
         assert!(msg.contains("Iteration 2 model response:\ntwo"));
         assert!(msg.contains("Iteration repl outputs"));
+    }
+
+    #[test]
+    fn build_iteration_message_truncates_to_history_tail() {
+        // Build more than HISTORY_TAIL (4) records to exercise truncation.
+        let history: Vec<RlmIterationRecord> = (1..=6)
+            .map(|i| RlmIterationRecord {
+                model_response: format!("step{i}"),
+                repl_outputs: vec![],
+            })
+            .collect();
+        let msg = build_iteration_message("task", &history);
+        // Iterations 1 and 2 fall outside the tail window and must be absent.
+        assert!(!msg.contains("Iteration 1 model response:"));
+        assert!(!msg.contains("Iteration 2 model response:"));
+        // Iterations 3-6 are within the last HISTORY_TAIL records and must appear.
+        assert!(msg.contains("Iteration 3 model response:\nstep3"));
+        assert!(msg.contains("Iteration 6 model response:\nstep6"));
     }
 }
