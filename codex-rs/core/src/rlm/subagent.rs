@@ -143,19 +143,36 @@ impl RlmSubagent {
             let model_response = model.next_step(prompt, &self.history).await?;
 
             let mut repl_outputs = Vec::new();
+            let mut had_repl_error = false;
             for repl_code in extract_repl_blocks(&model_response) {
-                let execution = self
-                    .repl
-                    .execute_code_with_callbacks(&repl_code, callbacks)?;
-                let rendered_output = if execution.stdout.is_empty() {
-                    execution.value.to_string()
-                } else {
-                    format!("{}{}", execution.stdout, execution.value)
-                };
-                repl_outputs.push(rendered_output);
+                match self.repl.execute_code_with_callbacks(&repl_code, callbacks) {
+                    Ok(execution) => {
+                        let rendered_output = if execution.stdout.is_empty() {
+                            execution.value.to_string()
+                        } else {
+                            format!("{}{}", execution.stdout, execution.value)
+                        };
+                        repl_outputs.push(rendered_output);
+                    }
+                    Err(err) => {
+                        repl_outputs.push(format!("REPL_ERROR: {err}"));
+                        had_repl_error = true;
+                        break;
+                    }
+                }
             }
 
-            let final_output = self.resolve_final_output(&model_response, callbacks)?;
+            let final_output = if had_repl_error {
+                None
+            } else {
+                match self.resolve_final_output(&model_response, callbacks) {
+                    Ok(output) => output,
+                    Err(err) => {
+                        repl_outputs.push(format!("FINAL_RESOLUTION_ERROR: {err}"));
+                        None
+                    }
+                }
+            };
             self.history.push(RlmIterationRecord {
                 model_response,
                 repl_outputs,
@@ -340,6 +357,52 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "subagent loop exhausted max iterations (1) before FINAL/FINAL_VAR"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_loop_recovers_after_repl_execution_error() -> Result<(), RlmSubagentError> {
+        let config = RlmSubagentConfig::new(2, 3)?;
+        let mut agent = RlmSubagent::with_new_repl(config, 1)?;
+        let mut model = MockModel::new(vec![
+            "```repl\nvalue = 8\nvalue.bit_length()\n```",
+            "```repl\nvalue = 21 * 2\n```\nFINAL_VAR(value)",
+        ]);
+
+        let result = agent
+            .run_loop_with_stub_callbacks("ignored prompt", &mut model)
+            .await?;
+
+        assert_eq!(result.final_output, "42");
+        assert_eq!(result.iteration_count, 2);
+        assert_eq!(result.history.len(), 2);
+        assert!(
+            result.history[0]
+                .repl_outputs
+                .iter()
+                .any(|output| output.contains("REPL_ERROR: monty repl execution failed"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_loop_recovers_after_final_resolution_error() -> Result<(), RlmSubagentError> {
+        let config = RlmSubagentConfig::new(2, 3)?;
+        let mut agent = RlmSubagent::with_new_repl(config, 1)?;
+        let mut model = MockModel::new(vec!["FINAL_VAR(missing_name)", "FINAL(done)"]);
+
+        let result = agent
+            .run_loop_with_stub_callbacks("ignored prompt", &mut model)
+            .await?;
+
+        assert_eq!(result.final_output, "done");
+        assert_eq!(result.iteration_count, 2);
+        assert_eq!(result.history.len(), 2);
+        assert!(
+            result.history[0].repl_outputs.iter().any(
+                |output| output.contains("FINAL_RESOLUTION_ERROR: monty repl execution failed")
+            )
         );
         Ok(())
     }
