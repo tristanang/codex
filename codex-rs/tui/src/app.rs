@@ -1511,11 +1511,12 @@ impl App {
 
         let harness_overrides =
             normalize_harness_overrides_for_cwd(harness_overrides, &config.cwd)?;
-        let thread_manager = Arc::new(ThreadManager::new(
+        let thread_manager = Arc::new(ThreadManager::new_with_provider(
             config.codex_home.clone(),
             auth_manager.clone(),
             SessionSource::Cli,
             config.model_catalog.clone(),
+            config.model_provider.clone(),
             CollaborationModesConfig {
                 default_mode_request_user_input: config
                     .features
