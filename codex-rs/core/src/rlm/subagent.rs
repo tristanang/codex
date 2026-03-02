@@ -7,8 +7,8 @@ use crate::rlm::monty_repl::StubHostCallbacks;
 use async_trait::async_trait;
 use thiserror::Error;
 
-const MIN_MAX_DEPTH: i32 = 2;
-const DEFAULT_MAX_ITERATIONS: usize = 16;
+pub(crate) const MIN_MAX_DEPTH: i32 = 2;
+pub(crate) const DEFAULT_MAX_ITERATIONS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RlmIterationRecord {
@@ -85,7 +85,6 @@ pub(crate) enum RlmSubagentError {
 pub(crate) struct RlmSubagent {
     repl: MontyReplRuntime,
     config: RlmSubagentConfig,
-    recursion_depth: i32,
     iteration_count: usize,
     history: Vec<RlmIterationRecord>,
 }
@@ -119,7 +118,6 @@ impl RlmSubagent {
         Ok(Self {
             repl,
             config,
-            recursion_depth,
             iteration_count: 0,
             history: Vec::new(),
         })
@@ -131,13 +129,6 @@ impl RlmSubagent {
         model: &mut impl RlmWorkerModel,
         callbacks: &impl MontyHostCallbacks,
     ) -> Result<RlmSubagentResult, RlmSubagentError> {
-        if self.recursion_depth > self.config.max_depth {
-            return Err(RlmSubagentError::DepthExceeded {
-                recursion_depth: self.recursion_depth,
-                max_depth: self.config.max_depth,
-            });
-        }
-
         while self.iteration_count < self.config.max_iterations {
             self.iteration_count += 1;
             let model_response = model.next_step(prompt, &self.history).await?;
