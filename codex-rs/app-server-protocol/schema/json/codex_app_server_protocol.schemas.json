@@ -8507,6 +8507,12 @@
               }
             ]
           },
+          "subagent_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "tools": {
             "anyOf": [
               {

@@ -188,6 +188,10 @@ pub struct Config {
     /// Model used specifically for review sessions.
     pub review_model: Option<String>,
 
+    /// Model used for spawned sub-agent calls (collab). Falls back to the
+    /// parent session model when `None`.
+    pub subagent_model: Option<String>,
+
     /// Size of the context window for the model, in tokens.
     pub model_context_window: Option<i64>,
 
@@ -1004,6 +1008,8 @@ pub struct ConfigToml {
     pub model: Option<String>,
     /// Review model override used by the `/review` feature.
     pub review_model: Option<String>,
+    /// Model override for spawned sub-agent (collab) calls.
+    pub subagent_model: Option<String>,
 
     /// Provider to use from the model_providers map.
     pub model_provider: Option<String>,
@@ -1546,6 +1552,7 @@ impl ConfigToml {
 pub struct ConfigOverrides {
     pub model: Option<String>,
     pub review_model: Option<String>,
+    pub subagent_model: Option<String>,
     pub cwd: Option<PathBuf>,
     pub approval_policy: Option<AskForApproval>,
     pub sandbox_mode: Option<SandboxMode>,
@@ -1676,6 +1683,7 @@ impl Config {
         let ConfigOverrides {
             model,
             review_model: override_review_model,
+            subagent_model: override_subagent_model,
             cwd,
             approval_policy: approval_policy_override,
             sandbox_mode,
@@ -2000,6 +2008,7 @@ impl Config {
             .or(cfg.zsh_path.map(Into::into));
 
         let review_model = override_review_model.or(cfg.review_model);
+        let subagent_model = override_subagent_model.or(cfg.subagent_model);
 
         let check_for_update_on_startup = cfg.check_for_update_on_startup.unwrap_or(true);
         let model_catalog = load_model_catalog(
@@ -2087,6 +2096,7 @@ impl Config {
         let config = Self {
             model,
             review_model,
+            subagent_model,
             model_context_window: cfg.model_context_window,
             model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
             model_provider_id,
@@ -4867,6 +4877,7 @@ model_verbosity = "high"
             Config {
                 model: Some("o3".to_string()),
                 review_model: None,
+                subagent_model: None,
                 model_context_window: None,
                 model_auto_compact_token_limit: None,
                 model_provider_id: "openai".to_string(),
@@ -4995,6 +5006,7 @@ model_verbosity = "high"
         let expected_gpt3_profile_config = Config {
             model: Some("gpt-3.5-turbo".to_string()),
             review_model: None,
+            subagent_model: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
             model_provider_id: "openai-custom".to_string(),
@@ -5121,6 +5133,7 @@ model_verbosity = "high"
         let expected_zdr_profile_config = Config {
             model: Some("o3".to_string()),
             review_model: None,
+            subagent_model: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
             model_provider_id: "openai".to_string(),
@@ -5233,6 +5246,7 @@ model_verbosity = "high"
         let expected_gpt5_profile_config = Config {
             model: Some("gpt-5.1".to_string()),
             review_model: None,
+            subagent_model: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
             model_provider_id: "openai".to_string(),
