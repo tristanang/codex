@@ -31,13 +31,43 @@ use tracing::info;
 const DEFAULT_MAX_ITERATIONS: usize = 16;
 const MIN_MAX_DEPTH: i32 = 2;
 const HISTORY_TAIL: usize = 4;
-const RLM_WORKER_INSTRUCTIONS: &str = r#"You are an RLM worker operating a persistent Python REPL.
-Use only ```repl``` fenced blocks for executable code.
-Do not call host callbacks: llm_query, read_file, write_file, list_files, shell.
-When complete, end with exactly one directive:
-- FINAL(<concise answer>)
-- FINAL_VAR(<python variable or expression>)
-If not complete, return more repl blocks without FINAL."#;
+const RLM_WORKER_INSTRUCTIONS: &str = r#"You are an RLM (Recursive Language Model) worker operating a persistent Python REPL environment. You will be queried iteratively until you provide a final answer.
+
+## REPL Environment
+- Execute Python code by wrapping it in ```repl``` fenced blocks.
+- The REPL is persistent: variables, functions, and state carry across iterations.
+- Use `print()` statements to inspect intermediate results. You will only see truncated output, so use print strategically.
+- The REPL runs Monty (a Python subset in Rust). Avoid unsupported features:
+  - Do NOT use `int.bit_length()`, `isinstance()`, or dynamic attribute access.
+  - Do NOT use nested subscript assignment like `mat[i][j] = 0`. Instead use flat indexing: `mat[i * n + j] = 0`.
+  - Stick to basic types (int, float, str, bool, list, dict, tuple) and standard control flow.
+
+## How To Work
+Think step by step carefully. Plan your approach, then execute immediately in ```repl``` blocks — do not just describe what you will do.
+- Offload heavy computation and large intermediate state into the REPL rather than reasoning about it in prose.
+- Reuse existing REPL state across iterations; do not recompute from scratch unless a prior error requires it.
+- Prefer efficient algorithms. Avoid unnecessary all-pairs or global recomputation.
+- Keep each iteration narrowly scoped to the next required step.
+- Run minimal validation needed to guarantee correctness.
+
+## Error Recovery
+- If transcript includes REPL_ERROR, analyze the error message, patch the failing logic, and continue. Do NOT repeat the same code that caused the error.
+- If transcript includes FINAL_RESOLUTION_ERROR, the variable you referenced may not exist. Create it in a ```repl``` block first, then use FINAL_VAR in a separate step.
+
+## Completing Your Task
+When you have finished, you MUST provide a final answer using exactly one of these directives (outside of code fences):
+1. `FINAL(your answer here)` — provide the answer directly as text
+2. `FINAL_VAR(variable_name)` — return an existing REPL variable's value
+
+WARNING — COMMON MISTAKE: FINAL_VAR retrieves an EXISTING variable. You MUST create and assign the variable in a ```repl``` block FIRST, then call FINAL_VAR in a SEPARATE iteration. Example:
+- WRONG: Calling FINAL_VAR(my_answer) without first creating `my_answer` in a repl block
+- CORRECT: First run ```repl
+my_answer = compute_result()
+print(my_answer)
+``` then in the NEXT response call FINAL_VAR(my_answer)
+
+Do NOT use FINAL/FINAL_VAR until you have completed the task and verified correctness.
+If not complete, return more ```repl``` blocks to make progress."#;
 
 pub struct RlmSubagentHandler;
 
@@ -97,6 +127,19 @@ impl ToolHandler for RlmSubagentHandler {
         let default_max_depth = turn.config.agent_max_depth.max(MIN_MAX_DEPTH);
         let max_depth = args.max_depth.unwrap_or(default_max_depth);
         let max_iterations = args.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
+
+        // Early validation before config creation
+        if max_depth < MIN_MAX_DEPTH {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "max_depth must be at least {MIN_MAX_DEPTH}, got {max_depth}"
+            )));
+        }
+        if recursion_depth > max_depth {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "recursion depth {recursion_depth} exceeds max_depth {max_depth}"
+            )));
+        }
+
         let config = RlmSubagentConfig::new(max_depth, max_iterations)
             .map_err(map_rlm_error_to_tool_error)?;
 
@@ -269,16 +312,16 @@ fn message_text_from_response_item(item: &ResponseItem) -> Option<String> {
 fn build_iteration_message(prompt: &str, history: &[RlmIterationRecord]) -> String {
     let mut message = format!("Task:\n{prompt}\n\n");
     if history.is_empty() {
-        message.push_str("No prior RLM iterations have run yet.\n");
+        message.push_str("You have not interacted with the REPL environment yet. Your next action should be to plan your approach and start executing in ```repl``` blocks. Do not provide a final answer yet.\n");
     } else {
-        message.push_str("Recent iteration transcript:\n");
+        message.push_str("The history below shows your previous interactions with the REPL environment.\n\nRecent iteration transcript:\n");
         let start = history.len().saturating_sub(HISTORY_TAIL);
         for (index, record) in history.iter().enumerate().skip(start) {
             let iteration = index + 1;
             message.push_str(&format!("\nIteration {iteration} model response:\n"));
             message.push_str(&record.model_response);
             if !record.repl_outputs.is_empty() {
-                message.push_str("\nIteration repl outputs:\n");
+                message.push_str("\nREPL outputs:\n");
                 for output in &record.repl_outputs {
                     message.push_str("- ");
                     message.push_str(output);
@@ -288,7 +331,7 @@ fn build_iteration_message(prompt: &str, history: &[RlmIterationRecord]) -> Stri
         }
     }
     message.push_str(
-        "\nReturn the next step now. Use ```repl``` for code, then FINAL(...) or FINAL_VAR(...) only when done.",
+        "\nContinue using the REPL environment by writing ```repl``` blocks. Use FINAL(...) or FINAL_VAR(...) only when your task is complete and verified.",
     );
     message
 }
@@ -313,6 +356,13 @@ mod tests {
         assert!(msg.contains("Task:\nsolve"));
         assert!(msg.contains("Iteration 1 model response:\none"));
         assert!(msg.contains("Iteration 2 model response:\ntwo"));
-        assert!(msg.contains("Iteration repl outputs"));
+        assert!(msg.contains("REPL outputs"));
+    }
+
+    #[test]
+    fn build_iteration_message_iteration_zero_safeguard() {
+        let msg = build_iteration_message("solve", &[]);
+        assert!(msg.contains("You have not interacted with the REPL environment yet"));
+        assert!(msg.contains("Do not provide a final answer yet"));
     }
 }

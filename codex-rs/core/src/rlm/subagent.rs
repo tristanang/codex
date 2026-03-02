@@ -246,11 +246,31 @@ fn extract_repl_blocks(model_response: &str) -> Vec<String> {
 }
 
 fn extract_directive_arg(model_response: &str, directive: &str) -> Option<String> {
+    // Strip fenced code regions to avoid matching FINAL(...) inside ```repl``` blocks.
+    let stripped = strip_fenced_regions(model_response);
     let token = format!("{directive}(");
-    let start = model_response.find(&token)?;
-    let tail = &model_response[start + token.len()..];
+    let start = stripped.find(&token)?;
+    let tail = &stripped[start + token.len()..];
     let end = tail.find(')')?;
     Some(tail[..end].trim().to_string())
+}
+
+/// Remove all ``` fenced code blocks from the text, returning only prose.
+fn strip_fenced_regions(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = text;
+    while let Some(fence_start) = cursor.find("```") {
+        result.push_str(&cursor[..fence_start]);
+        let after_fence = &cursor[fence_start + 3..];
+        if let Some(fence_end) = after_fence.find("```") {
+            cursor = &after_fence[fence_end + 3..];
+        } else {
+            // Unclosed fence — treat everything after as fenced (drop it)
+            return result;
+        }
+    }
+    result.push_str(cursor);
+    result
 }
 
 #[cfg(test)]
@@ -405,5 +425,27 @@ mod tests {
             )
         );
         Ok(())
+    }
+
+    #[test]
+    fn extract_directive_ignores_final_inside_fences() {
+        // FINAL(42) inside a ```repl``` block should NOT match
+        let response = "```repl\nresult = FINAL(42)\n```\nFINAL(the real answer)";
+        let result = extract_directive_arg(response, "FINAL");
+        assert_eq!(result.as_deref(), Some("the real answer"));
+    }
+
+    #[test]
+    fn extract_directive_none_when_only_inside_fences() {
+        let response = "```repl\nFINAL(42)\n```\nNo directive in prose.";
+        let result = extract_directive_arg(response, "FINAL");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn strip_fenced_regions_removes_code_blocks() {
+        let text = "before ```repl\ncode\n``` after ```python\nmore\n``` end";
+        let stripped = strip_fenced_regions(text);
+        assert_eq!(stripped, "before  after  end");
     }
 }
