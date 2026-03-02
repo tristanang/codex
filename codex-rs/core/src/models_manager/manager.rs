@@ -21,6 +21,8 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::ReasoningEffortPreset;
 use http::HeaderMap;
 use http::Method;
 use http::header::AUTHORIZATION;
@@ -38,6 +40,30 @@ use tracing::info;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const DEFAULT_MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 const MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+const GITHUB_BASELINE_PICKER_MODELS: usize = 6;
+const GITHUB_PINNED_PICKER_MODELS: [(&str, &str); 4] = [
+    ("claude-opus-4.6", "Claude Opus 4.6"),
+    ("claude-sonnet-4.6", "Claude Sonnet 4.6"),
+    ("gemini-3.1-pro-preview", "Gemini 3.1 Pro Preview"),
+    ("gemini-3-pro-preview", "Gemini 3 Pro Preview"),
+];
+
+fn pinned_reasoning_levels() -> Vec<ReasoningEffortPreset> {
+    vec![
+        ReasoningEffortPreset {
+            effort: ReasoningEffort::Low,
+            description: "Fast responses with lighter reasoning".to_string(),
+        },
+        ReasoningEffortPreset {
+            effort: ReasoningEffort::Medium,
+            description: "Balances speed and reasoning depth for everyday tasks".to_string(),
+        },
+        ReasoningEffortPreset {
+            effort: ReasoningEffort::High,
+            description: "Greater reasoning depth for complex problems".to_string(),
+        },
+    ]
+}
 
 #[derive(Debug, Deserialize)]
 struct GithubCopilotModelsResponse {
@@ -144,12 +170,15 @@ impl ModelsManager {
         } else {
             CatalogMode::Default
         };
-        let remote_models = model_catalog
+        let mut remote_models = model_catalog
             .map(|catalog| catalog.models)
             .unwrap_or_else(|| {
                 Self::load_remote_models_from_file()
                     .unwrap_or_else(|err| panic!("failed to load bundled models.json: {err}"))
             });
+        if matches!(catalog_mode, CatalogMode::Default) && provider.is_github_copilot() {
+            remote_models = Self::apply_github_pinned_catalog(remote_models);
+        }
         Self {
             remote_models: RwLock::new(remote_models),
             catalog_mode,
@@ -303,14 +332,11 @@ impl ModelsManager {
     /// Refresh available models according to the specified strategy.
     async fn refresh_available_models(&self, refresh_strategy: RefreshStrategy) -> CoreResult<()> {
         // don't override the custom model catalog if one was provided by the user
-        if matches!(self.catalog_mode, CatalogMode::Custom) {
+        if matches!(self.catalog_mode, CatalogMode::Custom) || self.provider.is_github_copilot() {
             return Ok(());
         }
 
-        let can_refresh_without_chatgpt_auth = self.provider.is_github_copilot();
-        if self.auth_manager.auth_mode() != Some(AuthMode::Chatgpt)
-            && !can_refresh_without_chatgpt_auth
-        {
+        if self.auth_manager.auth_mode() != Some(AuthMode::Chatgpt) {
             if matches!(
                 refresh_strategy,
                 RefreshStrategy::Offline | RefreshStrategy::OnlineIfUncached
@@ -459,6 +485,67 @@ impl ModelsManager {
         *self.remote_models.write().await = existing_models;
     }
 
+    fn apply_github_pinned_catalog(mut models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+        models.sort_by(|a, b| a.priority.cmp(&b.priority));
+
+        let mut picker_priority_slugs: Vec<String> = models
+            .iter()
+            .filter(|model| model.visibility == ModelVisibility::List && model.supported_in_api)
+            .map(|model| model.slug.clone())
+            .take(GITHUB_BASELINE_PICKER_MODELS)
+            .collect();
+
+        for (slug, display_name) in GITHUB_PINNED_PICKER_MODELS {
+            if let Some(existing) = models.iter_mut().find(|model| model.slug == slug) {
+                existing.display_name = display_name.to_string();
+                existing.visibility = ModelVisibility::List;
+                existing.supported_in_api = true;
+                if existing.supported_reasoning_levels.is_empty() {
+                    existing.supported_reasoning_levels = pinned_reasoning_levels();
+                    existing.default_reasoning_level = Some(ReasoningEffort::High);
+                }
+            } else {
+                let mut pinned = model_info::model_info_from_slug_quiet(slug);
+                pinned.slug = slug.to_string();
+                pinned.display_name = display_name.to_string();
+                pinned.visibility = ModelVisibility::List;
+                pinned.supported_in_api = true;
+                pinned.used_fallback_model_metadata = false;
+                pinned.supported_reasoning_levels = pinned_reasoning_levels();
+                pinned.default_reasoning_level = Some(ReasoningEffort::High);
+                models.push(pinned);
+            }
+
+            if !picker_priority_slugs
+                .iter()
+                .any(|candidate| candidate == slug)
+            {
+                picker_priority_slugs.push(slug.to_string());
+            }
+        }
+
+        let mut next_priority = 0;
+        for slug in &picker_priority_slugs {
+            if let Some(model) = models.iter_mut().find(|model| model.slug == *slug) {
+                model.priority = next_priority;
+                next_priority += 1;
+            }
+        }
+
+        for model in &mut models {
+            if picker_priority_slugs
+                .iter()
+                .any(|candidate| candidate == &model.slug)
+            {
+                continue;
+            }
+            model.priority = next_priority;
+            next_priority += 1;
+        }
+
+        models
+    }
+
     fn load_remote_models_from_file() -> Result<Vec<ModelInfo>, std::io::Error> {
         let file_contents = include_str!("../../models.json");
         let response: ModelsResponse = serde_json::from_str(file_contents)?;
@@ -518,11 +605,13 @@ impl ModelsManager {
     ) -> Self {
         let cache_path = codex_home.join(MODEL_CACHE_FILE);
         let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
+        let mut remote_models = Self::load_remote_models_from_file()
+            .unwrap_or_else(|err| panic!("failed to load bundled models.json: {err}"));
+        if provider.is_github_copilot() {
+            remote_models = Self::apply_github_pinned_catalog(remote_models);
+        }
         Self {
-            remote_models: RwLock::new(
-                Self::load_remote_models_from_file()
-                    .unwrap_or_else(|err| panic!("failed to load bundled models.json: {err}")),
-            ),
+            remote_models: RwLock::new(remote_models),
             catalog_mode: CatalogMode::Default,
             collaboration_modes_config: CollaborationModesConfig::default(),
             auth_manager,
@@ -575,11 +664,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use tempfile::tempdir;
-    use wiremock::Mock;
     use wiremock::MockServer;
-    use wiremock::ResponseTemplate;
-    use wiremock::matchers::method;
-    use wiremock::matchers::path;
 
     fn remote_model(slug: &str, display: &str, priority: i32) -> ModelInfo {
         remote_model_with_visibility(slug, display, priority, "list")
@@ -1104,48 +1189,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_available_models_fetches_github_models_without_chatgpt_auth() {
+    async fn refresh_available_models_uses_pinned_github_catalog_without_network() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/models"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "object": "list",
-                "data": [
-                    {
-                        "id": "gpt-5.2-codex",
-                        "name": "GPT-5.2 Codex",
-                        "model_picker_enabled": true,
-                        "supported_endpoints": ["/responses"]
-                    },
-                    {
-                        "id": "gpt-5-mini",
-                        "name": "GPT-5 mini",
-                        "model_picker_enabled": false,
-                        "supported_endpoints": ["/responses"]
-                    },
-                    {
-                        "id": "chat-only-model",
-                        "name": "Chat Only",
-                        "model_picker_enabled": true,
-                        "supported_endpoints": ["/chat/completions"]
-                    },
-                    {
-                        "id": "claude-3.7-sonnet",
-                        "name": "Claude 3.7 Sonnet",
-                        "model_picker_enabled": false,
-                        "supported_endpoints": ["/chat/completions"]
-                    },
-                    {
-                        "id": "GEMINI-2.5-PRO",
-                        "name": "Gemini 2.5 Pro",
-                        "model_picker_enabled": false,
-                        "supported_endpoints": null
-                    }
-                ]
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
 
         let codex_home = tempdir().expect("temp dir");
         let auth_manager = Arc::new(AuthManager::new(
@@ -1165,40 +1210,58 @@ mod tests {
         manager
             .refresh_available_models(RefreshStrategy::Online)
             .await
-            .expect("github provider should refresh without chatgpt auth");
+            .expect("github provider should use pinned catalog");
+
+        let available = manager.list_models(RefreshStrategy::OnlineIfUncached).await;
+        let mut bundled_models = ModelsManager::load_remote_models_from_file().unwrap_or_default();
+        bundled_models.sort_by(|a, b| a.priority.cmp(&b.priority));
+        let mut expected_top_models: Vec<String> = bundled_models
+            .into_iter()
+            .filter(|model| model.visibility == ModelVisibility::List && model.supported_in_api)
+            .map(|model| model.slug)
+            .take(GITHUB_BASELINE_PICKER_MODELS)
+            .collect();
+        expected_top_models.extend(
+            GITHUB_PINNED_PICKER_MODELS
+                .iter()
+                .map(|(slug, _)| (*slug).to_string()),
+        );
+        let top_models: Vec<String> = available
+            .iter()
+            .filter(|preset| preset.show_in_picker)
+            .map(|preset| preset.model.clone())
+            .take(expected_top_models.len())
+            .collect();
+        assert_eq!(top_models, expected_top_models);
 
         let cached_remote = manager.get_remote_models().await;
-        let codex_model = cached_remote
-            .iter()
-            .find(|candidate| candidate.slug == "gpt-5.2-codex")
-            .expect("responses model should be merged into cache");
-        assert_eq!(codex_model.display_name, "GPT-5.2 Codex");
-        assert_eq!(codex_model.visibility, ModelVisibility::List);
-
-        let mini_model = cached_remote
-            .iter()
-            .find(|candidate| candidate.slug == "gpt-5-mini")
-            .expect("second responses model should be merged into cache");
-        assert_eq!(mini_model.visibility, ModelVisibility::Hide);
-
-        let claude_model = cached_remote
-            .iter()
-            .find(|candidate| candidate.slug == "claude-3.7-sonnet")
-            .expect("whitelisted claude chat/completions model should be merged into cache");
-        assert_eq!(claude_model.visibility, ModelVisibility::List);
-
-        let gemini_model = cached_remote
-            .iter()
-            .find(|candidate| candidate.slug == "GEMINI-2.5-PRO")
-            .expect("whitelisted gemini chat/completions model should be merged into cache");
-        assert_eq!(gemini_model.visibility, ModelVisibility::List);
-
         assert!(
-            !cached_remote
+            cached_remote
                 .iter()
-                .any(|candidate| candidate.slug == "chat-only-model"),
-            "non-whitelisted chat-only models should be filtered out"
+                .any(|model| model.slug == "claude-opus-4.6")
         );
+        assert!(
+            cached_remote
+                .iter()
+                .any(|model| model.slug == "gemini-3.1-pro-preview")
+        );
+
+        for (slug, _) in GITHUB_PINNED_PICKER_MODELS {
+            let preset = available
+                .iter()
+                .find(|p| p.model == slug)
+                .unwrap_or_else(|| panic!("pinned model {slug} should be in available list"));
+            assert_eq!(
+                preset.default_reasoning_effort,
+                ReasoningEffort::High,
+                "pinned model {slug} should default to high reasoning"
+            );
+            assert_eq!(
+                preset.supported_reasoning_efforts.len(),
+                3,
+                "pinned model {slug} should have 3 reasoning levels"
+            );
+        }
 
         let requests = server
             .received_requests()
@@ -1208,7 +1271,10 @@ mod tests {
             .iter()
             .filter(|request| request.url.path() == "/models")
             .count();
-        assert_eq!(models_requests, 1, "expected one GET /models request");
+        assert_eq!(
+            models_requests, 0,
+            "GitHub pinned catalog should avoid /models"
+        );
     }
 
     #[test]
