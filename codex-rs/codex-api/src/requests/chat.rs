@@ -12,6 +12,7 @@ use http::HeaderMap;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
+use tracing::warn;
 
 /// Assembled request body plus headers for Chat Completions streaming calls.
 pub struct ChatRequest {
@@ -65,13 +66,12 @@ impl<'a> ChatRequestBuilder<'a> {
         for item in input {
             match item {
                 ResponseItem::Message { role, .. } => last_emitted_role = Some(role.as_str()),
-                ResponseItem::FunctionCall { .. } | ResponseItem::LocalShellCall { .. } => {
-                    last_emitted_role = Some("assistant")
-                }
-                ResponseItem::FunctionCallOutput { .. } => last_emitted_role = Some("tool"),
+                ResponseItem::FunctionCall { .. }
+                | ResponseItem::LocalShellCall { .. }
+                | ResponseItem::CustomToolCall { .. } => last_emitted_role = Some("assistant"),
+                ResponseItem::FunctionCallOutput { .. }
+                | ResponseItem::CustomToolCallOutput { .. } => last_emitted_role = Some("tool"),
                 ResponseItem::Reasoning { .. } | ResponseItem::Other => {}
-                ResponseItem::CustomToolCall { .. } => {}
-                ResponseItem::CustomToolCallOutput { .. } => {}
                 ResponseItem::WebSearchCall { .. } => {}
                 ResponseItem::GhostSnapshot { .. } => {}
                 ResponseItem::Compaction { .. } => {}
@@ -172,8 +172,17 @@ impl<'a> ChatRequestBuilder<'a> {
                         }
                     }
 
+                    let merge_into_previous_tool_call_message = role == "assistant"
+                        && matches!(
+                            messages.last(),
+                            Some(Value::Object(obj))
+                                if obj.get("role").and_then(Value::as_str) == Some("assistant")
+                                    && obj.get("tool_calls").is_some()
+                        );
+
                     if role == "assistant" {
-                        if let Some(prev) = &last_assistant_text
+                        if !merge_into_previous_tool_call_message
+                            && let Some(prev) = &last_assistant_text
                             && prev == &text
                         {
                             continue;
@@ -188,6 +197,34 @@ impl<'a> ChatRequestBuilder<'a> {
                     } else {
                         json!(text)
                     };
+
+                    if merge_into_previous_tool_call_message {
+                        if let Some(Value::Object(obj)) = messages.last_mut() {
+                            if let Some(content) = obj.get_mut("content") {
+                                match content {
+                                    Value::String(existing) => existing.push_str(&text),
+                                    _ => *content = Value::String(text.clone()),
+                                }
+                            } else {
+                                obj.insert("content".to_string(), Value::String(text.clone()));
+                            }
+
+                            if let Some(reasoning) = reasoning_by_anchor_index.get(&idx) {
+                                if let Some(Value::String(existing)) = obj.get_mut("reasoning") {
+                                    if !existing.is_empty() {
+                                        existing.push('\n');
+                                    }
+                                    existing.push_str(reasoning);
+                                } else {
+                                    obj.insert(
+                                        "reasoning".to_string(),
+                                        Value::String(reasoning.clone()),
+                                    );
+                                }
+                            }
+                        }
+                        continue;
+                    }
 
                     let mut msg = json!({"role": role, "content": content_value});
                     if role == "assistant"
@@ -205,25 +242,28 @@ impl<'a> ChatRequestBuilder<'a> {
                     ..
                 } => {
                     let reasoning = reasoning_by_anchor_index.get(&idx).map(String::as_str);
+                    let normalized_arguments =
+                        normalize_tool_call_arguments(arguments, call_id, name);
                     let tool_call = json!({
                         "id": call_id,
                         "type": "function",
                         "function": {
                             "name": name,
-                            "arguments": arguments,
+                            "arguments": normalized_arguments,
                         }
                     });
                     push_tool_call_message(&mut messages, tool_call, reasoning);
                 }
                 ResponseItem::LocalShellCall {
                     id,
-                    call_id: _,
+                    call_id,
                     status,
                     action,
                 } => {
                     let reasoning = reasoning_by_anchor_index.get(&idx).map(String::as_str);
+                    let resolved_id = call_id.clone().or_else(|| id.clone()).unwrap_or_default();
                     let tool_call = json!({
-                        "id": id.clone().unwrap_or_default(),
+                        "id": resolved_id,
                         "type": "local_shell_call",
                         "status": status,
                         "action": action,
@@ -255,14 +295,13 @@ impl<'a> ChatRequestBuilder<'a> {
                     }));
                 }
                 ResponseItem::CustomToolCall {
-                    id,
-                    call_id: _,
+                    call_id,
                     name,
                     input,
-                    status: _,
+                    ..
                 } => {
                     let tool_call = json!({
-                        "id": id,
+                        "id": call_id,
                         "type": "custom",
                         "custom": {
                             "name": name,
@@ -312,13 +351,19 @@ impl<'a> ChatRequestBuilder<'a> {
 
 fn push_tool_call_message(messages: &mut Vec<Value>, tool_call: Value, reasoning: Option<&str>) {
     // Chat Completions requires that tool calls are grouped into a single assistant message
-    // (with `tool_calls: [...]`) followed by tool role responses.
+    // (with `tool_calls: [...]`) followed by tool role responses. When the assistant produces
+    // text *and* tool calls in the same turn, the Responses-API history stores them as separate
+    // items (a Message followed by one or more FunctionCall items). We must merge them back
+    // into a single Chat Completions assistant message so that providers that enforce strict
+    // role alternation (e.g. Claude) don't reject the request.
     if let Some(Value::Object(obj)) = messages.last_mut()
         && obj.get("role").and_then(Value::as_str) == Some("assistant")
-        && obj.get("content").is_some_and(Value::is_null)
-        && let Some(tool_calls) = obj.get_mut("tool_calls").and_then(Value::as_array_mut)
     {
-        tool_calls.push(tool_call);
+        if let Some(tool_calls) = obj.get_mut("tool_calls").and_then(Value::as_array_mut) {
+            tool_calls.push(tool_call);
+        } else {
+            obj.insert("tool_calls".to_string(), json!([tool_call]));
+        }
         if let Some(reasoning) = reasoning {
             if let Some(Value::String(existing)) = obj.get_mut("reasoning") {
                 if !existing.is_empty() {
@@ -346,6 +391,21 @@ fn push_tool_call_message(messages: &mut Vec<Value>, tool_call: Value, reasoning
         obj.insert("reasoning".to_string(), json!(reasoning));
     }
     messages.push(msg);
+}
+
+fn normalize_tool_call_arguments(arguments: &str, call_id: &str, name: &str) -> String {
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(value) => value.to_string(),
+        Err(err) => {
+            warn!(
+                ?err,
+                call_id,
+                name,
+                "invalid tool call arguments in history; replacing with empty object"
+            );
+            "{}".to_string()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -479,5 +539,225 @@ mod tests {
         assert_eq!(messages[4]["tool_call_id"], "call-b");
         assert_eq!(messages[5]["role"], "tool");
         assert_eq!(messages[5]["tool_call_id"], "call-c");
+    }
+
+    #[test]
+    fn merges_tool_call_into_preceding_assistant_text_message() {
+        // When Claude responds with text AND a tool call in the same turn, the
+        // Responses-API history stores them as a Message item followed by a
+        // FunctionCall item. The builder must merge them into a single Chat
+        // Completions assistant message so Claude's API (which requires strict
+        // role alternation) doesn't reject the request.
+        let prompt_input = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "read the file".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "Let me read that file.".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "exec_command".to_string(),
+                arguments: r#"{"cmd":"cat foo.rs"}"#.to_string(),
+                call_id: "call-1".to_string(),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "call-1".to_string(),
+                output: FunctionCallOutputPayload::from_text("file contents".to_string()),
+            },
+        ];
+
+        let req = ChatRequestBuilder::new("gpt-test", "inst", &prompt_input, &[])
+            .build(&provider())
+            .expect("request");
+
+        let messages = req
+            .body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .expect("messages array");
+        // system + user + assistant(text + tool_calls) + tool output
+        assert_eq!(messages.len(), 4);
+
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "user");
+
+        let assistant_msg = &messages[2];
+        assert_eq!(assistant_msg["role"], "assistant");
+        assert_eq!(assistant_msg["content"], "Let me read that file.");
+        let tool_calls = assistant_msg["tool_calls"]
+            .as_array()
+            .expect("tool_calls array");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["id"], "call-1");
+
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "call-1");
+    }
+
+    #[test]
+    fn merges_assistant_text_into_preceding_tool_call_message() {
+        // Some providers can emit a tool call item and then an assistant text
+        // item in the same turn. We must merge them into one assistant message
+        // so tool outputs still immediately follow the tool call.
+        let prompt_input = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "read the file".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "exec_command".to_string(),
+                arguments: r#"{"cmd":"cat foo.rs"}"#.to_string(),
+                call_id: "call-1".to_string(),
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "Let me read that file.".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "call-1".to_string(),
+                output: FunctionCallOutputPayload::from_text("file contents".to_string()),
+            },
+        ];
+
+        let req = ChatRequestBuilder::new("gpt-test", "inst", &prompt_input, &[])
+            .build(&provider())
+            .expect("request");
+
+        let messages = req
+            .body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .expect("messages array");
+        // system + user + assistant(text + tool_calls) + tool output
+        assert_eq!(messages.len(), 4);
+
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "user");
+
+        let assistant_msg = &messages[2];
+        assert_eq!(assistant_msg["role"], "assistant");
+        assert_eq!(assistant_msg["content"], "Let me read that file.");
+        let tool_calls = assistant_msg["tool_calls"]
+            .as_array()
+            .expect("tool_calls array");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["id"], "call-1");
+
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "call-1");
+    }
+
+    #[test]
+    fn custom_tool_call_uses_call_id_not_item_id() {
+        let prompt_input = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "search".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::CustomToolCall {
+                id: Some("item-999".to_string()),
+                status: None,
+                call_id: "toolu_vrtx_abc123".to_string(),
+                name: "mcp_search".to_string(),
+                input: r#"{"q":"test"}"#.to_string(),
+            },
+            ResponseItem::CustomToolCallOutput {
+                call_id: "toolu_vrtx_abc123".to_string(),
+                output: FunctionCallOutputPayload::from_text("results".to_string()),
+            },
+        ];
+
+        let req = ChatRequestBuilder::new("gpt-test", "inst", &prompt_input, &[])
+            .build(&provider())
+            .expect("request");
+
+        let messages = req
+            .body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .expect("messages array");
+        // system + user + assistant(tool_calls) + tool output
+        assert_eq!(messages.len(), 4);
+
+        let assistant_msg = &messages[2];
+        let tool_calls = assistant_msg["tool_calls"]
+            .as_array()
+            .expect("tool_calls array");
+        // Must use call_id, not the item id
+        assert_eq!(tool_calls[0]["id"], "toolu_vrtx_abc123");
+
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "toolu_vrtx_abc123");
+    }
+
+    #[test]
+    fn replaces_invalid_function_arguments_with_empty_object() {
+        let prompt_input = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "run tool".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "bad_tool".to_string(),
+                arguments: "{\"broken\":".to_string(),
+                call_id: "call-bad".to_string(),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "call-bad".to_string(),
+                output: FunctionCallOutputPayload::from_text("done".to_string()),
+            },
+        ];
+
+        let req = ChatRequestBuilder::new("gpt-test", "inst", &prompt_input, &[])
+            .build(&provider())
+            .expect("request");
+
+        let messages = req
+            .body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .expect("messages array");
+
+        let assistant_msg = &messages[2];
+        let tool_calls = assistant_msg["tool_calls"]
+            .as_array()
+            .expect("tool_calls array");
+        assert_eq!(tool_calls[0]["id"], "call-bad");
+        assert_eq!(tool_calls[0]["function"]["arguments"], "{}");
     }
 }
