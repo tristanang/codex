@@ -658,6 +658,47 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
     })
 }
 
+fn create_run_rlm_subagent_tool() -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "prompt".to_string(),
+            JsonSchema::String {
+                description: Some("Task for the RLM subagent worker.".to_string()),
+            },
+        ),
+        (
+            "max_depth".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "Optional recursion depth budget for this RLM run. Must be at least 2."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "max_iterations".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "Optional iteration budget for this RLM run. Defaults to 16.".to_string(),
+                ),
+            },
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "run_rlm_subagent".to_string(),
+        description:
+            "Run an RLM-style subagent loop (REPL + iterative model steps) and return final output."
+                .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["prompt".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
 fn create_spawn_agents_on_csv_tool() -> ToolSpec {
     let mut properties = BTreeMap::new();
     properties.insert(
@@ -1694,6 +1735,7 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::PlanHandler;
     use crate::tools::handlers::ReadFileHandler;
     use crate::tools::handlers::RequestUserInputHandler;
+    use crate::tools::handlers::RlmSubagentHandler;
     use crate::tools::handlers::SearchToolBm25Handler;
     use crate::tools::handlers::ShellCommandHandler;
     use crate::tools::handlers::ShellHandler;
@@ -1858,11 +1900,14 @@ pub(crate) fn build_specs(
 
     if config.collab_tools {
         let multi_agent_handler = Arc::new(MultiAgentHandler);
+        let rlm_subagent_handler = Arc::new(RlmSubagentHandler);
+        builder.push_spec(create_run_rlm_subagent_tool());
         builder.push_spec(create_spawn_agent_tool(config));
         builder.push_spec(create_send_input_tool());
         builder.push_spec(create_resume_agent_tool());
         builder.push_spec(create_wait_tool());
         builder.push_spec(create_close_agent_tool());
+        builder.register_handler("run_rlm_subagent", rlm_subagent_handler);
         builder.register_handler("spawn_agent", multi_agent_handler.clone());
         builder.register_handler("send_input", multi_agent_handler.clone());
         builder.register_handler("resume_agent", multi_agent_handler.clone());
@@ -2147,6 +2192,7 @@ mod tests {
         assert_contains_tool_names(
             &tools,
             &[
+                "run_rlm_subagent",
                 "spawn_agent",
                 "send_input",
                 "wait",
@@ -2176,6 +2222,7 @@ mod tests {
         assert_contains_tool_names(
             &tools,
             &[
+                "run_rlm_subagent",
                 "spawn_agent",
                 "send_input",
                 "resume_agent",
