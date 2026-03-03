@@ -84,7 +84,7 @@ async fn get_agent_return_mode(agent_id: ThreadId) -> SpawnAgentReturnMode {
         .unwrap_or(SpawnAgentReturnMode::ReturnSummary)
 }
 
-async fn clear_agent_return_mode(agent_id: ThreadId) {
+pub(crate) async fn clear_agent_return_mode(agent_id: ThreadId) {
     let mut return_modes = agent_return_modes().write().await;
     return_modes.remove(&agent_id);
 }

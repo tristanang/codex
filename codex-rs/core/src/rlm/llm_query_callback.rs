@@ -174,6 +174,8 @@ async fn run_single_child_query(
         .agent_control
         .shutdown_agent(thread_id)
         .await;
+    // Clean up the return mode entry to prevent leaking into the global map.
+    crate::tools::handlers::multi_agents::clear_agent_return_mode(thread_id).await;
     let status = status_result?;
     match status {
         AgentStatus::Completed(Some(output)) => Ok(output),
