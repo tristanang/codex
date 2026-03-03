@@ -89,6 +89,10 @@ crate.annotation(
     deps = ["@zstd"],
 )
 crate.annotation(
+    crate = "monty",
+    strip_prefix = "crates/monty",
+)
+crate.annotation(
     build_script_env = {
         "AWS_LC_SYS_NO_JITTER_ENTROPY": "1",
     },
