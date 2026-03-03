@@ -152,6 +152,10 @@ crate.annotation(
     crate = "runfiles",
     workspace_cargo_toml = "rust/runfiles/Cargo.toml",
 )
+crate.annotation(
+    crate = "monty",
+    strip_prefix = "crates/monty",
+)
 
 llvm = use_extension("@toolchains_llvm_bootstrapped//extensions:llvm.bzl", "llvm")
 use_repo(llvm, "llvm-project")

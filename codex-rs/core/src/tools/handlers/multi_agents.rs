@@ -33,7 +33,10 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::OnceLock;
+use tokio::sync::RwLock;
 
 pub struct MultiAgentHandler;
 
@@ -41,6 +44,50 @@ pub struct MultiAgentHandler;
 pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
 pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
 pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = 3600 * 1000;
+const RETURN_VALUE_MODE_INSTRUCTIONS: &str = "You are operating in return_value mode. Your final response must be exactly one valid JSON value with no markdown fences and no surrounding prose.";
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SpawnAgentReturnMode {
+    #[default]
+    ReturnSummary,
+    ReturnValue,
+}
+
+impl SpawnAgentReturnMode {
+    fn is_return_value(self) -> bool {
+        matches!(self, Self::ReturnValue)
+    }
+}
+
+static AGENT_RETURN_MODES: OnceLock<RwLock<HashMap<ThreadId, SpawnAgentReturnMode>>> =
+    OnceLock::new();
+
+fn agent_return_modes() -> &'static RwLock<HashMap<ThreadId, SpawnAgentReturnMode>> {
+    AGENT_RETURN_MODES.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+async fn set_agent_return_mode(agent_id: ThreadId, return_mode: SpawnAgentReturnMode) {
+    let mut return_modes = agent_return_modes().write().await;
+    if return_mode.is_return_value() {
+        return_modes.insert(agent_id, return_mode);
+    } else {
+        return_modes.remove(&agent_id);
+    }
+}
+
+async fn get_agent_return_mode(agent_id: ThreadId) -> SpawnAgentReturnMode {
+    let return_modes = agent_return_modes().read().await;
+    return_modes
+        .get(&agent_id)
+        .copied()
+        .unwrap_or(SpawnAgentReturnMode::ReturnSummary)
+}
+
+pub(crate) async fn clear_agent_return_mode(agent_id: ThreadId) {
+    let mut return_modes = agent_return_modes().write().await;
+    return_modes.remove(&agent_id);
+}
 
 #[derive(Debug, Deserialize)]
 struct CloseAgentArgs {
@@ -106,12 +153,15 @@ mod spawn {
         agent_type: Option<String>,
         #[serde(default)]
         fork_context: bool,
+        #[serde(default)]
+        return_mode: SpawnAgentReturnMode,
     }
 
     #[derive(Debug, Serialize)]
     struct SpawnAgentResult {
         agent_id: String,
         nickname: Option<String>,
+        return_mode: SpawnAgentReturnMode,
     }
 
     pub async fn handle(
@@ -121,6 +171,7 @@ mod spawn {
         arguments: String,
     ) -> Result<ToolOutput, FunctionCallError> {
         let args: SpawnAgentArgs = parse_arguments(&arguments)?;
+        let return_mode = args.return_mode;
         let role_name = args
             .agent_type
             .as_deref()
@@ -154,6 +205,7 @@ mod spawn {
             .map_err(FunctionCallError::RespondToModel)?;
         apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
         apply_spawn_agent_overrides(&mut config, child_depth);
+        apply_spawn_agent_return_mode_overrides(&mut config, return_mode);
 
         let result = session
             .services
@@ -205,6 +257,7 @@ mod spawn {
             )
             .await;
         let new_thread_id = result?;
+        set_agent_return_mode(new_thread_id, return_mode).await;
         let role_tag = role_name.unwrap_or(DEFAULT_ROLE_NAME);
         turn.otel_manager
             .counter("codex.multi_agent.spawn", 1, &[("role", role_tag)]);
@@ -212,6 +265,7 @@ mod spawn {
         let content = serde_json::to_string(&SpawnAgentResult {
             agent_id: new_thread_id.to_string(),
             nickname,
+            return_mode,
         })
         .map_err(|err| {
             FunctionCallError::Fatal(format!("failed to serialize spawn_agent result: {err}"))
@@ -476,9 +530,11 @@ pub(crate) mod wait {
         timeout_ms: Option<i64>,
     }
 
-    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Debug, Deserialize, Serialize, PartialEq)]
     pub(crate) struct WaitResult {
         pub(crate) status: HashMap<ThreadId, AgentStatus>,
+        #[serde(default)]
+        pub(crate) values: HashMap<ThreadId, Value>,
         pub(crate) timed_out: bool,
     }
 
@@ -613,9 +669,22 @@ pub(crate) mod wait {
 
         // Convert payload.
         let statuses_map = statuses.clone().into_iter().collect::<HashMap<_, _>>();
+        let mut values = HashMap::with_capacity(statuses_map.len());
+        for (thread_id, status) in &statuses_map {
+            let return_mode = get_agent_return_mode(*thread_id).await;
+            if let Some(value) =
+                parse_structured_value_for_status(*thread_id, status, return_mode, true)?
+            {
+                values.insert(*thread_id, value);
+            }
+            if matches!(status, AgentStatus::NotFound | AgentStatus::Shutdown) {
+                clear_agent_return_mode(*thread_id).await;
+            }
+        }
         let agent_statuses = build_wait_agent_statuses(&statuses_map, &receiver_agents);
         let result = WaitResult {
             status: statuses_map.clone(),
+            values,
             timed_out: statuses.is_empty(),
         };
 
@@ -673,6 +742,7 @@ pub mod close_agent {
     #[derive(Debug, Deserialize, Serialize)]
     pub(super) struct CloseAgentResult {
         pub(super) status: AgentStatus,
+        pub(super) value: Option<Value>,
     }
 
     pub async fn handle(
@@ -752,10 +822,14 @@ pub mod close_agent {
             )
             .await;
         result?;
+        let return_mode = get_agent_return_mode(agent_id).await;
+        clear_agent_return_mode(agent_id).await;
+        let value = parse_structured_value_for_status(agent_id, &status, return_mode, false)?;
 
-        let content = serde_json::to_string(&CloseAgentResult { status }).map_err(|err| {
-            FunctionCallError::Fatal(format!("failed to serialize close_agent result: {err}"))
-        })?;
+        let content =
+            serde_json::to_string(&CloseAgentResult { status, value }).map_err(|err| {
+                FunctionCallError::Fatal(format!("failed to serialize close_agent result: {err}"))
+            })?;
 
         Ok(ToolOutput::Function {
             body: FunctionCallOutputBody::Text(content),
@@ -956,9 +1030,112 @@ fn apply_spawn_agent_runtime_overrides(
     Ok(())
 }
 
-fn apply_spawn_agent_overrides(config: &mut Config, child_depth: i32) {
+pub(crate) fn apply_spawn_agent_overrides(config: &mut Config, child_depth: i32) {
     if child_depth >= config.agent_max_depth {
         config.features.disable(Feature::Collab);
+    }
+}
+
+pub(crate) fn apply_spawn_agent_return_mode_overrides(
+    config: &mut Config,
+    return_mode: SpawnAgentReturnMode,
+) {
+    if !return_mode.is_return_value() {
+        return;
+    }
+    if let Some(base_instructions) = &mut config.base_instructions {
+        base_instructions.push_str("\n\n");
+        base_instructions.push_str(RETURN_VALUE_MODE_INSTRUCTIONS);
+    } else {
+        config.base_instructions = Some(RETURN_VALUE_MODE_INSTRUCTIONS.to_string());
+    }
+}
+
+fn parse_structured_value_for_status(
+    agent_id: ThreadId,
+    status: &AgentStatus,
+    return_mode: SpawnAgentReturnMode,
+    require_completed: bool,
+) -> Result<Option<Value>, FunctionCallError> {
+    if !return_mode.is_return_value() {
+        return Ok(None);
+    }
+    if !matches!(status, AgentStatus::Completed(_)) {
+        if require_completed {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "agent {agent_id} was configured with return_value mode but ended with status {status:?}"
+            )));
+        }
+        return Ok(None);
+    }
+
+    parse_return_value(status).map(Some).map_err(|err| {
+        FunctionCallError::RespondToModel(format!(
+            "agent {agent_id} return_value validation failed after one repair attempt: {err}"
+        ))
+    })
+}
+
+fn parse_return_value(status: &AgentStatus) -> Result<Value, String> {
+    match status {
+        AgentStatus::Completed(Some(output)) => parse_json_with_one_repair(output),
+        AgentStatus::Completed(None) => Err("agent completed without a final message".to_string()),
+        AgentStatus::PendingInit | AgentStatus::Running => {
+            Err("agent did not reach a completed status".to_string())
+        }
+        AgentStatus::Errored(err) => Err(format!("agent errored before returning a value: {err}")),
+        AgentStatus::Shutdown => Err("agent was shutdown before returning a value".to_string()),
+        AgentStatus::NotFound => Err("agent was not found".to_string()),
+    }
+}
+
+fn parse_json_with_one_repair(raw: &str) -> Result<Value, String> {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(value) => Ok(value),
+        Err(initial_err) => {
+            let Some(candidate) = json_repair_candidate(raw) else {
+                return Err(format!("invalid json output: {initial_err}"));
+            };
+            serde_json::from_str::<Value>(&candidate).map_err(|repair_err| {
+                format!(
+                    "invalid json output: initial parse failed ({initial_err}); repair parse failed ({repair_err})"
+                )
+            })
+        }
+    }
+}
+
+fn json_repair_candidate(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("```")
+        && let Some(first_newline) = trimmed.find('\n')
+        && let Some(last_fence) = trimmed.rfind("```")
+        && last_fence > first_newline
+    {
+        return Some(trimmed[first_newline + 1..last_fence].trim().to_string());
+    }
+
+    let object_candidate = trimmed
+        .find('{')
+        .zip(trimmed.rfind('}'))
+        .filter(|(start, end)| start < end)
+        .map(|(start, end)| trimmed[start..=end].trim().to_string());
+    let array_candidate = trimmed
+        .find('[')
+        .zip(trimmed.rfind(']'))
+        .filter(|(start, end)| start < end)
+        .map(|(start, end)| trimmed[start..=end].trim().to_string());
+    match (object_candidate, array_candidate) {
+        (Some(object), Some(array)) => {
+            if trimmed.find('{').unwrap_or(usize::MAX) < trimmed.find('[').unwrap_or(usize::MAX) {
+                Some(object)
+            } else {
+                Some(array)
+            }
+        }
+        (Some(object), None) => Some(object),
+        (None, Some(array)) => Some(array),
+        (None, None) => None,
     }
 }
 
@@ -1822,6 +1999,7 @@ mod tests {
                     (id_a, AgentStatus::NotFound),
                     (id_b, AgentStatus::NotFound),
                 ]),
+                values: HashMap::new(),
                 timed_out: false
             }
         );
@@ -1863,6 +2041,7 @@ mod tests {
             result,
             wait::WaitResult {
                 status: HashMap::new(),
+                values: HashMap::new(),
                 timed_out: true
             }
         );
@@ -1960,6 +2139,7 @@ mod tests {
             result,
             wait::WaitResult {
                 status: HashMap::from([(agent_id, AgentStatus::Shutdown)]),
+                values: HashMap::new(),
                 timed_out: false
             }
         );
@@ -2007,6 +2187,66 @@ mod tests {
 
         let status_after = manager.agent_control().get_status(agent_id).await;
         assert_eq!(status_after, AgentStatus::NotFound);
+    }
+
+    #[test]
+    fn parse_structured_value_keeps_return_summary_behavior() {
+        let agent_id = ThreadId::new();
+        let status = AgentStatus::Completed(Some("not-json".to_string()));
+        let value = parse_structured_value_for_status(
+            agent_id,
+            &status,
+            SpawnAgentReturnMode::ReturnSummary,
+            true,
+        )
+        .expect("return_summary mode should skip structured parsing");
+        assert_eq!(value, None);
+    }
+
+    #[test]
+    fn parse_structured_value_accepts_json_output() {
+        let agent_id = ThreadId::new();
+        let status = AgentStatus::Completed(Some(r#"{"ok":true}"#.to_string()));
+        let value = parse_structured_value_for_status(
+            agent_id,
+            &status,
+            SpawnAgentReturnMode::ReturnValue,
+            true,
+        )
+        .expect("json output should parse");
+        assert_eq!(value, Some(json!({"ok": true})));
+    }
+
+    #[test]
+    fn parse_structured_value_repairs_fenced_json_once() {
+        let agent_id = ThreadId::new();
+        let status = AgentStatus::Completed(Some("```json\n{\"ok\": true}\n```".to_string()));
+        let value = parse_structured_value_for_status(
+            agent_id,
+            &status,
+            SpawnAgentReturnMode::ReturnValue,
+            true,
+        )
+        .expect("fenced json should be repaired once");
+        assert_eq!(value, Some(json!({"ok": true})));
+    }
+
+    #[test]
+    fn parse_structured_value_errors_after_failed_repair() {
+        let agent_id = ThreadId::new();
+        let status = AgentStatus::Completed(Some("definitely-not-json".to_string()));
+        let Err(err) = parse_structured_value_for_status(
+            agent_id,
+            &status,
+            SpawnAgentReturnMode::ReturnValue,
+            true,
+        ) else {
+            panic!("invalid JSON should fail validation");
+        };
+        let FunctionCallError::RespondToModel(msg) = err else {
+            panic!("expected respond-to-model error");
+        };
+        assert!(msg.contains("validation failed after one repair attempt"));
     }
 
     #[tokio::test]
