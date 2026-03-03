@@ -65,6 +65,7 @@ iana-time-zone = { workspace = true }
 indexmap = { workspace = true }
 keyring = { workspace = true, features = ["crypto-rust"] }
 libc = { workspace = true }
+monty = { git = "https://github.com/pydantic/monty", rev = "47427c03df805065de6074012a949a4e08fc45f2" }
 notify = { workspace = true }
 once_cell = { workspace = true }
 os_info = { workspace = true }

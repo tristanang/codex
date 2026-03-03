@@ -642,12 +642,21 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
                 ),
             },
         ),
+        (
+            "return_mode".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Optional return contract for this agent. Use `return_summary` (default) for normal conversational output, or `return_value` to require a final JSON value."
+                        .to_string(),
+                ),
+            },
+        ),
     ]);
 
     ToolSpec::Function(ResponsesApiTool {
         name: "spawn_agent".to_string(),
         description:
-            "Spawn a sub-agent for a well-scoped task. Returns the agent id (and user-facing nickname when available) to use to communicate with this agent."
+            "Spawn a sub-agent for a well-scoped task. Returns the agent id (and user-facing nickname when available) to use to communicate with this agent. Supports `return_mode` for summary vs structured JSON returns."
                 .to_string(),
         strict: false,
         parameters: JsonSchema::Object {
@@ -1297,6 +1306,30 @@ fn create_list_dir_tool() -> ToolSpec {
     })
 }
 
+fn create_python_repl_tool() -> ToolSpec {
+    let properties = BTreeMap::from([(
+        "code".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Python source code to execute in a persistent Monty REPL. State persists for this agent session."
+                    .to_string(),
+            ),
+        },
+    )]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "python_repl".to_string(),
+        description: "Runs Python in a persistent Monty REPL sandbox for computation and iterative reasoning. Exposes llm_query(prompt, schema={...}) and llm_query_batched(prompts, schema={...}) for structured sub-agent queries."
+            .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["code".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
 fn create_js_repl_tool() -> ToolSpec {
     // Keep JS input freeform, but block the most common malformed payload shapes
     // (JSON wrappers, quoted strings, and markdown fences) before they reach the
@@ -1692,6 +1725,7 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::McpResourceHandler;
     use crate::tools::handlers::MultiAgentHandler;
     use crate::tools::handlers::PlanHandler;
+    use crate::tools::handlers::PythonReplHandler;
     use crate::tools::handlers::ReadFileHandler;
     use crate::tools::handlers::RequestUserInputHandler;
     use crate::tools::handlers::SearchToolBm25Handler;
@@ -1716,6 +1750,7 @@ pub(crate) fn build_specs(
     let request_user_input_handler = Arc::new(RequestUserInputHandler {
         default_mode_request_user_input: config.default_mode_request_user_input,
     });
+    let python_repl_handler = Arc::new(PythonReplHandler);
     let search_tool_handler = Arc::new(SearchToolBm25Handler);
     let js_repl_handler = Arc::new(JsReplHandler);
     let js_repl_reset_handler = Arc::new(JsReplResetHandler);
@@ -1855,6 +1890,8 @@ pub(crate) fn build_specs(
 
     builder.push_spec_with_parallel_support(create_view_image_tool(), true);
     builder.register_handler("view_image", view_image_handler);
+    builder.push_spec(create_python_repl_tool());
+    builder.register_handler("python_repl", python_repl_handler);
 
     if config.collab_tools {
         let multi_agent_handler = Arc::new(MultiAgentHandler);
@@ -2111,6 +2148,7 @@ mod tests {
                 external_web_access: Some(true),
             },
             create_view_image_tool(),
+            create_python_repl_tool(),
         ] {
             expected.insert(tool_name(&spec).to_string(), spec);
         }
@@ -2332,6 +2370,7 @@ mod tests {
             vec![shell_tool]
         };
         expected.extend(expected_tail);
+        expected.push("python_repl");
         assert_model_tools(model_slug, features, web_search_mode, &expected);
     }
 
@@ -2482,6 +2521,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "python_repl",
             ],
         );
     }
@@ -2502,6 +2542,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "python_repl",
             ],
         );
     }
@@ -2593,6 +2634,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "python_repl",
             ],
         );
     }
