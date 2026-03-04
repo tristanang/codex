@@ -1355,6 +1355,30 @@ fn create_list_dir_tool() -> ToolSpec {
     })
 }
 
+fn create_python_repl_tool() -> ToolSpec {
+    let properties = BTreeMap::from([(
+        "code".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Python source code to execute. State persists across calls within this session."
+                    .to_string(),
+            ),
+        },
+    )]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "python_repl".to_string(),
+        description: "Runs Python code in a persistent sandboxed REPL. Variables and state persist across calls within the same session. Use for computation, data transformation, string manipulation, and multi-step logic that benefits from programmatic control flow rather than natural language reasoning. No filesystem or network access."
+            .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["code".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
 fn create_js_repl_tool() -> ToolSpec {
     // Keep JS input freeform, but block the most common malformed payload shapes
     // (JSON wrappers, quoted strings, and markdown fences) before they reach the
@@ -1751,6 +1775,7 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::MultiAgentHandler;
     use crate::tools::handlers::PlanHandler;
     use crate::tools::handlers::PresentationArtifactHandler;
+    use crate::tools::handlers::PythonReplHandler;
     use crate::tools::handlers::ReadFileHandler;
     use crate::tools::handlers::RequestUserInputHandler;
     use crate::tools::handlers::SearchToolBm25Handler;
@@ -1778,6 +1803,7 @@ pub(crate) fn build_specs(
     let search_tool_handler = Arc::new(SearchToolBm25Handler);
     let js_repl_handler = Arc::new(JsReplHandler);
     let js_repl_reset_handler = Arc::new(JsReplResetHandler);
+    let python_repl_handler = Arc::new(PythonReplHandler);
     let presentation_artifact_handler = Arc::new(PresentationArtifactHandler);
     let request_permission_enabled = config.request_permission_enabled;
 
@@ -1915,6 +1941,8 @@ pub(crate) fn build_specs(
 
     builder.push_spec_with_parallel_support(create_view_image_tool(), true);
     builder.register_handler("view_image", view_image_handler);
+    builder.push_spec(create_python_repl_tool());
+    builder.register_handler("python_repl", python_repl_handler);
 
     if config.presentation_artifact {
         builder.push_spec(create_presentation_artifact_tool());
@@ -2176,6 +2204,7 @@ mod tests {
                 external_web_access: Some(true),
             },
             create_view_image_tool(),
+            create_python_repl_tool(),
         ] {
             expected.insert(tool_name(&spec).to_string(), spec);
         }
@@ -2414,6 +2443,7 @@ mod tests {
             vec![shell_tool]
         };
         expected.extend(expected_tail);
+        expected.push("python_repl");
         assert_model_tools(model_slug, features, web_search_mode, &expected);
     }
 
@@ -2564,6 +2594,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "python_repl",
             ],
         );
     }
@@ -2584,6 +2615,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "python_repl",
             ],
         );
     }
@@ -2675,6 +2707,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "python_repl",
             ],
         );
     }
