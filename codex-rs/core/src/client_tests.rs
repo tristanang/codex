@@ -15,6 +15,13 @@ fn test_model_client(session_source: SessionSource) -> ModelClient {
         "https://example.com/v1",
         crate::model_provider_info::WireApi::Responses,
     );
+    test_model_client_with_provider(session_source, provider)
+}
+
+fn test_model_client_with_provider(
+    session_source: SessionSource,
+    provider: crate::model_provider_info::ModelProviderInfo,
+) -> ModelClient {
     ModelClient::new(
         None,
         ThreadId::new(),
@@ -83,6 +90,40 @@ fn build_subagent_headers_sets_other_subagent_label() {
         .get("x-openai-subagent")
         .and_then(|value| value.to_str().ok());
     assert_eq!(value, Some("memory_consolidation"));
+}
+
+#[test]
+fn build_subagent_headers_sets_agent_initiator_for_github_copilot_subagent() {
+    let provider = crate::model_provider_info::ModelProviderInfo::create_github_copilot_provider();
+    let client = test_model_client_with_provider(
+        SessionSource::SubAgent(SubAgentSource::Other("review".to_string())),
+        provider,
+    );
+    let headers = client.build_subagent_headers();
+    let subagent = headers
+        .get("x-openai-subagent")
+        .and_then(|value| value.to_str().ok());
+    let initiator = headers
+        .get("x-initiator")
+        .and_then(|value| value.to_str().ok());
+    assert_eq!(subagent, Some("review"));
+    assert_eq!(initiator, Some("agent"));
+}
+
+#[test]
+fn build_responses_options_sets_agent_initiator_for_github_copilot_subagent() {
+    let provider = crate::model_provider_info::ModelProviderInfo::create_github_copilot_provider();
+    let client = test_model_client_with_provider(
+        SessionSource::SubAgent(SubAgentSource::Other("review".to_string())),
+        provider,
+    );
+    let session = client.new_session();
+    let options = session.build_responses_options(None, codex_api::requests::responses::Compression::None);
+    let initiator = options
+        .extra_headers
+        .get("x-initiator")
+        .and_then(|value| value.to_str().ok());
+    assert_eq!(initiator, Some("agent"));
 }
 
 #[tokio::test]

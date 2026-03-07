@@ -105,3 +105,61 @@ wire_api = "chat"
     let err = toml::from_str::<ModelProviderInfo>(provider_toml).unwrap_err();
     assert!(err.to_string().contains(CHAT_WIRE_API_REMOVED_ERROR));
 }
+
+#[test]
+fn github_copilot_provider_uses_responses_and_expected_headers() {
+    let provider = ModelProviderInfo::create_github_copilot_provider();
+
+    assert_eq!(provider.name, GITHUB_COPILOT_PROVIDER_NAME);
+    assert_eq!(
+        provider.base_url,
+        Some(GITHUB_COPILOT_DEFAULT_BASE_URL.to_string())
+    );
+    assert_eq!(provider.env_key, Some(GITHUB_COPILOT_TOKEN_ENV_VAR.to_string()));
+    assert_eq!(provider.wire_api, WireApi::Responses);
+    assert_eq!(provider.requires_openai_auth, false);
+    assert_eq!(provider.supports_websockets, false);
+
+    let headers = provider.http_headers.expect("copilot provider has headers");
+    assert_eq!(
+        headers.get(GITHUB_COPILOT_INTENT_HEADER_NAME),
+        Some(&GITHUB_COPILOT_INTENT_HEADER_VALUE.to_string())
+    );
+    assert_eq!(
+        headers.get(GITHUB_COPILOT_INITIATOR_HEADER_NAME),
+        Some(&GITHUB_COPILOT_INITIATOR_HEADER_VALUE.to_string())
+    );
+    assert_eq!(
+        headers
+            .get("User-Agent")
+            .expect("copilot provider has user-agent")
+            .starts_with(GITHUB_COPILOT_USER_AGENT_PREFIX),
+        true
+    );
+}
+
+#[test]
+fn built_in_providers_include_github_copilot() {
+    let providers = built_in_model_providers(None);
+    assert_eq!(providers.contains_key(GITHUB_COPILOT_PROVIDER_ID), true);
+    assert_eq!(
+        providers[GITHUB_COPILOT_PROVIDER_ID].wire_api,
+        WireApi::Responses
+    );
+}
+
+#[test]
+fn github_copilot_detection_matches_common_provider_shapes() {
+    let provider = ModelProviderInfo::create_github_copilot_provider();
+    assert!(provider.is_github_copilot());
+
+    let mut by_env =
+        create_oss_provider_with_base_url("http://localhost:1234/v1", WireApi::Responses);
+    by_env.env_key = Some("GITHUB_TOKEN".to_string());
+    assert!(by_env.is_github_copilot());
+
+    let mut by_base_url =
+        create_oss_provider_with_base_url("https://copilot-api.example.com", WireApi::Responses);
+    by_base_url.env_key = None;
+    assert!(by_base_url.is_github_copilot());
+}

@@ -79,3 +79,12 @@ the realtime start message in prompt history and does not change websocket
 backend prompt settings or the realtime end/inactive message.
 
 Ctrl+C/Ctrl+D quitting uses a ~1 second double-press hint (`ctrl + c again to quit`).
+
+## Local GitHub provider
+
+For local/fork builds using GitHub Copilot as the model provider:
+
+1. Run `codex-provider-auth github login` to complete OAuth and store credentials.
+2. Run `codex-provider-auth github setup` to write `model_provider = "github-copilot"` in `~/.codex/config.toml`.
+
+This uses the standard `model_provider` key.

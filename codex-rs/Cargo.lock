@@ -2336,6 +2336,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "toml 0.9.11+spec-1.1.0",
  "wiremock",
 ]
 
