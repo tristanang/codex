@@ -46,6 +46,7 @@ use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::handle_non_tool_response_item;
 use crate::stream_events_utils::handle_output_item_done;
 use crate::stream_events_utils::last_assistant_message_from_item;
+use crate::stream_events_utils::normalize_completed_assistant_message_id;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::stream_events_utils::record_completed_response_item;
 use crate::terminal;
@@ -6999,11 +7000,13 @@ async fn emit_turn_item_in_plan_mode(
 async fn handle_assistant_item_done_in_plan_mode(
     sess: &Session,
     turn_context: &TurnContext,
-    item: &ResponseItem,
+    item: &mut ResponseItem,
     state: &mut PlanModeStreamState,
     previously_active_item: Option<&TurnItem>,
     last_agent_message: &mut Option<String>,
 ) -> bool {
+    normalize_completed_assistant_message_id(item, previously_active_item);
+
     if let ResponseItem::Message { role, .. } = item
         && role == "assistant"
     {
@@ -7135,7 +7138,7 @@ async fn try_run_sampling_request(
 
         match event {
             ResponseEvent::Created => {}
-            ResponseEvent::OutputItemDone(item) => {
+            ResponseEvent::OutputItemDone(mut item) => {
                 let previously_active_item = active_item.take();
                 if let Some(previous) = previously_active_item.as_ref()
                     && matches!(previous, TurnItem::AgentMessage(_))
@@ -7154,7 +7157,7 @@ async fn try_run_sampling_request(
                     && handle_assistant_item_done_in_plan_mode(
                         &sess,
                         &turn_context,
-                        &item,
+                        &mut item,
                         state,
                         previously_active_item.as_ref(),
                         &mut last_agent_message,

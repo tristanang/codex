@@ -130,6 +130,31 @@ async fn record_stage1_output_usage_for_completed_item(
     }
 }
 
+pub(crate) fn normalize_completed_assistant_message_id(
+    item: &mut ResponseItem,
+    previously_active_item: Option<&TurnItem>,
+) {
+    let Some(TurnItem::AgentMessage(active_agent_message)) = previously_active_item else {
+        return;
+    };
+
+    let ResponseItem::Message { role, id, .. } = item else {
+        return;
+    };
+
+    if role != "assistant" || id.as_ref() == Some(&active_agent_message.id) {
+        return;
+    }
+
+    let completed_item_id = id.clone();
+    *id = Some(active_agent_message.id.clone());
+    debug!(
+        active_item_id = %active_agent_message.id,
+        completed_item_id = ?completed_item_id,
+        "normalizing completed assistant message id to match active item"
+    );
+}
+
 /// Handle a completed output item from the model stream, recording it and
 /// queuing any tool execution futures. This records items immediately so
 /// history and rollout stay in sync even if the turn is later cancelled.
@@ -153,11 +178,13 @@ pub(crate) struct HandleOutputCtx {
 #[instrument(level = "trace", skip_all)]
 pub(crate) async fn handle_output_item_done(
     ctx: &mut HandleOutputCtx,
-    item: ResponseItem,
+    mut item: ResponseItem,
     previously_active_item: Option<TurnItem>,
 ) -> Result<OutputItemResult> {
     let mut output = OutputItemResult::default();
     let plan_mode = ctx.turn_context.collaboration_mode.mode == ModeKind::Plan;
+
+    normalize_completed_assistant_message_id(&mut item, previously_active_item.as_ref());
 
     match ToolRouter::build_tool_call(ctx.sess.as_ref(), item.clone()).await {
         // The model emitted a tool call; log it, persist the item immediately, and queue the tool execution.

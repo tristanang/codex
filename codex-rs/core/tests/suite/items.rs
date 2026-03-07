@@ -438,6 +438,69 @@ async fn agent_message_content_delta_has_item_metadata() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn assistant_message_completion_reuses_streamed_item_id_when_done_id_differs()
+-> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+
+    let TestCodex { codex, .. } = test_codex().build(&server).await?;
+
+    let stream = sse(vec![
+        ev_response_created("resp-1"),
+        ev_message_item_added("msg-added", ""),
+        ev_output_text_delta("streamed response"),
+        ev_assistant_message("msg-done", "streamed response"),
+        ev_completed("resp-1"),
+    ]);
+    mount_sse_once(&server, stream).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "please stream text".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await?;
+
+    let started_item = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::ItemStarted(ItemStartedEvent {
+            item: TurnItem::AgentMessage(item),
+            ..
+        }) => Some(item.clone()),
+        _ => None,
+    })
+    .await;
+
+    let delta_event = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::AgentMessageContentDelta(event) => Some(event.clone()),
+        _ => None,
+    })
+    .await;
+
+    let completed_item = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::ItemCompleted(ItemCompletedEvent {
+            item: TurnItem::AgentMessage(item),
+            ..
+        }) => Some(item.clone()),
+        _ => None,
+    })
+    .await;
+
+    assert_eq!(started_item.id, "msg-added");
+    assert_eq!(delta_event.item_id, "msg-added");
+    assert_eq!(completed_item.id, "msg-added");
+    let Some(AgentMessageContent::Text { text }) = completed_item.content.first() else {
+        panic!("expected agent message text content");
+    };
+    assert_eq!(text, "streamed response");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plan_mode_emits_plan_item_from_proposed_plan_block() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -607,6 +670,91 @@ async fn plan_mode_strips_plan_from_agent_messages() -> anyhow::Result<()> {
         })
         .collect();
     assert_eq!(agent_text_from_item, "Intro\nOutro");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_mode_assistant_completion_reuses_streamed_item_id_when_done_id_differs()
+-> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+
+    let TestCodex {
+        codex,
+        session_configured,
+        ..
+    } = test_codex().build(&server).await?;
+
+    let stream = sse(vec![
+        ev_response_created("resp-1"),
+        ev_message_item_added("msg-added", ""),
+        ev_output_text_delta("streamed response"),
+        ev_assistant_message("msg-done", "streamed response"),
+        ev_completed("resp-1"),
+    ]);
+    mount_sse_once(&server, stream).await;
+
+    let collaboration_mode = CollaborationMode {
+        mode: ModeKind::Plan,
+        settings: Settings {
+            model: session_configured.model.clone(),
+            reasoning_effort: None,
+            developer_instructions: None,
+        },
+    };
+
+    codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "please plan".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: std::env::current_dir()?,
+            approval_policy: codex_protocol::protocol::AskForApproval::Never,
+            sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
+            model: session_configured.model.clone(),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: Some(collaboration_mode),
+            personality: None,
+        })
+        .await?;
+
+    let started_item = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::ItemStarted(ItemStartedEvent {
+            item: TurnItem::AgentMessage(item),
+            ..
+        }) => Some(item.clone()),
+        _ => None,
+    })
+    .await;
+
+    let delta_event = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::AgentMessageContentDelta(event) => Some(event.clone()),
+        _ => None,
+    })
+    .await;
+
+    let completed_item = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::ItemCompleted(ItemCompletedEvent {
+            item: TurnItem::AgentMessage(item),
+            ..
+        }) => Some(item.clone()),
+        _ => None,
+    })
+    .await;
+
+    assert_eq!(started_item.id, "msg-added");
+    assert_eq!(delta_event.item_id, "msg-added");
+    assert_eq!(completed_item.id, "msg-added");
+    let Some(AgentMessageContent::Text { text }) = completed_item.content.first() else {
+        panic!("expected agent message text content");
+    };
+    assert_eq!(text, "streamed response");
 
     Ok(())
 }
