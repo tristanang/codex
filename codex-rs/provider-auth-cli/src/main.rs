@@ -1,6 +1,9 @@
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
+use codex_core::config::CONFIG_TOML_FILE;
+use codex_core::config::edit::ConfigEdit;
+use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config::find_codex_home;
 use codex_core::github_copilot_auth;
 use codex_core::github_copilot_auth::GithubCopilotAuth;
@@ -9,14 +12,18 @@ use reqwest::header::ACCEPT;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::header::USER_AGENT;
 use serde::Deserialize;
+use std::fs;
 use std::io;
 use std::path::Path;
 use std::time::Duration;
+use toml::Value as TomlValue;
 
 const GITHUB_COPILOT_OAUTH_CLIENT_ID: &str = "Ov23li8tweQw6odWQebz";
 const GITHUB_COPILOT_OAUTH_SCOPE: &str = "read:user";
 const DEFAULT_GITHUB_DOMAIN: &str = "github.com";
 const LOGIN_SUCCESS_MESSAGE: &str = "Successfully logged in";
+const MODEL_PROVIDER_KEY: &str = "model_provider";
+const GITHUB_PROVIDER_ID: &str = "github-copilot";
 
 #[derive(Debug, Clone, Copy)]
 struct GithubOAuthPollingConfig {
@@ -47,9 +54,21 @@ struct GitHubAccessTokenResponse {
     interval: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GithubStatus {
+    auth_present: bool,
+    provider_configured: bool,
+}
+
+impl GithubStatus {
+    fn is_ready(&self) -> bool {
+        self.auth_present && self.provider_configured
+    }
+}
+
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(name = "codex-provider-auth")]
-#[command(about = "Provider authentication helpers")]
+#[command(about = "Provider authentication and setup helpers")]
 struct Cli {
     #[command(subcommand)]
     provider: ProviderCommand,
@@ -57,7 +76,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 enum ProviderCommand {
-    /// GitHub provider authentication helpers.
+    /// GitHub provider authentication and setup.
     Github(GithubCommand),
 }
 
@@ -71,6 +90,12 @@ struct GithubCommand {
 enum GithubSubcommand {
     /// Login via GitHub device-code OAuth and save credentials.
     Login(GithubLoginArgs),
+
+    /// Configure config.toml to use the GitHub provider in local builds.
+    Setup,
+
+    /// Show whether login and setup are complete.
+    Status,
 
     /// Remove saved GitHub OAuth credentials.
     Logout,
@@ -112,6 +137,50 @@ async fn run() -> i32 {
                     }
                 }
             }
+            GithubSubcommand::Setup => match run_github_setup(&codex_home) {
+                Ok(()) => {
+                    eprintln!(
+                        "Configured {MODEL_PROVIDER_KEY} = \"{GITHUB_PROVIDER_ID}\" in config.toml"
+                    );
+                    0
+                }
+                Err(err) => {
+                    eprintln!("Error configuring provider: {err}");
+                    1
+                }
+            },
+            GithubSubcommand::Status => match run_github_status(&codex_home) {
+                Ok(status) => {
+                    eprintln!(
+                        "GitHub OAuth credentials: {}",
+                        if status.auth_present {
+                            "present"
+                        } else {
+                            "missing"
+                        }
+                    );
+                    eprintln!(
+                        "Provider setup ({MODEL_PROVIDER_KEY}): {}",
+                        if status.provider_configured {
+                            "configured"
+                        } else {
+                            "missing or not github-copilot"
+                        }
+                    );
+                    if status.is_ready() {
+                        0
+                    } else {
+                        eprintln!(
+                            "Run `codex-provider-auth github login` and `codex-provider-auth github setup`."
+                        );
+                        1
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Error checking GitHub provider status: {err}");
+                    1
+                }
+            },
             GithubSubcommand::Logout => match run_github_logout(&codex_home) {
                 Ok(true) => {
                     eprintln!("Removed GitHub Copilot credentials");
@@ -153,8 +222,55 @@ async fn run_github_login(codex_home: &Path, enterprise_url: Option<String>) -> 
     github_copilot_auth::save(codex_home, &auth)
 }
 
+fn run_github_setup(codex_home: &Path) -> io::Result<()> {
+    ConfigEditsBuilder::new(codex_home)
+        .with_edits([ConfigEdit::SetPath {
+            segments: vec![MODEL_PROVIDER_KEY.to_string()],
+            value: GITHUB_PROVIDER_ID.to_string().into(),
+        }])
+        .apply_blocking()
+        .map_err(|err| io::Error::other(format!("failed to persist config.toml: {err}")))
+}
+
+fn run_github_status(codex_home: &Path) -> io::Result<GithubStatus> {
+    let auth_present = github_copilot_auth::load(codex_home)?.is_some();
+    let provider_configured =
+        read_model_provider(codex_home)?.as_deref() == Some(GITHUB_PROVIDER_ID);
+
+    Ok(GithubStatus {
+        auth_present,
+        provider_configured,
+    })
+}
+
 fn run_github_logout(codex_home: &Path) -> io::Result<bool> {
     github_copilot_auth::remove(codex_home)
+}
+
+fn read_model_provider(codex_home: &Path) -> io::Result<Option<String>> {
+    let config_path = codex_home.join(CONFIG_TOML_FILE);
+    let config_contents = match fs::read_to_string(&config_path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(io::Error::new(
+                err.kind(),
+                format!("failed to read {}: {err}", config_path.display()),
+            ));
+        }
+    };
+
+    let config: TomlValue = toml::from_str(&config_contents).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to parse {}: {err}", config_path.display()),
+        )
+    })?;
+
+    Ok(config
+        .get(MODEL_PROVIDER_KEY)
+        .and_then(TomlValue::as_str)
+        .map(str::to_string))
 }
 
 fn github_oauth_urls(enterprise_domain: Option<&str>) -> (String, String) {
@@ -373,10 +489,30 @@ mod tests {
     }
 
     #[test]
-    fn parses_github_logout() {
+    fn parses_github_setup_status_and_logout() {
+        let setup =
+            Cli::try_parse_from(["codex-provider-auth", "github", "setup"]).expect("setup parse");
+        let status =
+            Cli::try_parse_from(["codex-provider-auth", "github", "status"]).expect("status parse");
         let logout =
             Cli::try_parse_from(["codex-provider-auth", "github", "logout"]).expect("logout parse");
 
+        assert_eq!(
+            setup,
+            Cli {
+                provider: ProviderCommand::Github(GithubCommand {
+                    command: GithubSubcommand::Setup,
+                }),
+            }
+        );
+        assert_eq!(
+            status,
+            Cli {
+                provider: ProviderCommand::Github(GithubCommand {
+                    command: GithubSubcommand::Status,
+                }),
+            }
+        );
         assert_eq!(
             logout,
             Cli {
@@ -574,6 +710,90 @@ mod tests {
             err.to_string().contains("unsupported_grant_type bad grant"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn setup_writes_model_provider_only() {
+        let codex_home = tempdir().expect("tempdir");
+
+        run_github_setup(codex_home.path()).expect("setup succeeds");
+
+        let config_contents =
+            fs::read_to_string(codex_home.path().join(CONFIG_TOML_FILE)).expect("read config.toml");
+        let config: TomlValue = toml::from_str(&config_contents).expect("parse toml");
+
+        assert_eq!(
+            config.get(MODEL_PROVIDER_KEY).and_then(TomlValue::as_str),
+            Some(GITHUB_PROVIDER_ID)
+        );
+        assert_eq!(config.get("model_provider_beta"), None);
+    }
+
+    #[test]
+    fn status_is_ready_only_when_auth_and_setup_are_present() {
+        let codex_home = tempdir().expect("tempdir");
+
+        let not_ready = run_github_status(codex_home.path()).expect("status");
+        assert_eq!(
+            not_ready,
+            GithubStatus {
+                auth_present: false,
+                provider_configured: false,
+            }
+        );
+        assert!(!not_ready.is_ready());
+
+        github_copilot_auth::save(
+            codex_home.path(),
+            &GithubCopilotAuth {
+                access_token: "token-123".to_string(),
+                enterprise_domain: None,
+            },
+        )
+        .expect("save auth");
+        fs::write(
+            codex_home.path().join(CONFIG_TOML_FILE),
+            "model_provider = \"github-copilot\"\n",
+        )
+        .expect("write config");
+
+        let ready = run_github_status(codex_home.path()).expect("status");
+        assert_eq!(
+            ready,
+            GithubStatus {
+                auth_present: true,
+                provider_configured: true,
+            }
+        );
+        assert!(ready.is_ready());
+    }
+
+    #[test]
+    fn status_is_not_ready_when_provider_value_does_not_match() {
+        let codex_home = tempdir().expect("tempdir");
+        github_copilot_auth::save(
+            codex_home.path(),
+            &GithubCopilotAuth {
+                access_token: "token-123".to_string(),
+                enterprise_domain: None,
+            },
+        )
+        .expect("save auth");
+        fs::write(
+            codex_home.path().join(CONFIG_TOML_FILE),
+            "model_provider = \"openai\"\n",
+        )
+        .expect("write config");
+
+        let status = run_github_status(codex_home.path()).expect("status");
+        assert_eq!(
+            status,
+            GithubStatus {
+                auth_present: true,
+                provider_configured: false,
+            }
+        );
+        assert!(!status.is_ready());
     }
 
     #[test]
