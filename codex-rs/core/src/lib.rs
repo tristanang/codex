@@ -43,6 +43,7 @@ mod file_watcher;
 mod flags;
 pub mod git_info;
 mod guardian;
+pub mod github_copilot_auth;
 pub mod instructions;
 pub mod landlock;
 pub mod mcp;
